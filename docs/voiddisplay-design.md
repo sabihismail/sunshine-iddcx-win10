@@ -19,8 +19,12 @@ removed; there is no keepalive.
 
 - Class: Display, `{4d36e968-e325-11ce-bfc1-08002be10318}`.
 - Hardware id: `Root\Void\Display`.
-- UMDF extension: `IddCx0102` initially (broad compatibility). The extension token
-  is bumped only when HDR requires a newer IddCx level.
+- UMDF extension: the INF binds `IddCx0102` so the driver loads on the widest range
+  of Windows. The binary is compiled against the IddCx 1.4 headers (UMDF 2.25) with
+  the minimum version set to 1.3, and any post-1.2 DDI is gated at runtime with
+  `IDD_IS_FUNCTION_AVAILABLE`. One binary therefore runs on older hosts (1.2/1.3
+  feature set) and lights up newer features where the running OS supports them
+  (see section 7). The HDR path will compile against a newer header still.
 - `PnpLockdown=1`. The INF installs WUDFRd, sets the `IndirectKmd` upper filter, and
   sets a `DeviceGroupId` of `VoidDisplayGroup`.
 
@@ -156,20 +160,41 @@ Display state is optional-persistent so a configured host survives reboot:
 Persistence is a convenience layer over the in-memory table; the in-memory table is
 always the source of truth while the driver is running.
 
-## 7. Logging
+## 7. Preferred render GPU (parent adapter)
+
+On a multi-GPU headless host (for example an encode GPU plus an iGPU) the OS would
+otherwise auto-pick the adapter that composes the virtual desktop. The operator can
+pin it so the desktop is rendered on the GPU that also does capture/encode, avoiding
+a cross-adapter copy.
+
+- Configured via the driver's WUDF service Parameters key:
+  `...\WUDF\Services\VoidDisplay\Parameters\PreferredRenderAdapterVendorId`
+  (REG_DWORD). `0` or absent = auto; `0x10DE` = NVIDIA, `0x1002` = AMD,
+  `0x8086` = Intel. The INF seeds the value at `0` (auto).
+- At adapter init-finished the driver reads the value, enumerates DXGI adapters,
+  finds the first non-software adapter from that vendor, and pins it with
+  `IddCxAdapterSetRenderAdapter(adapter, { LUID })` - done before any monitor is
+  added, as recommended.
+- This DDI is IddCx 1.4+. The call is gated by `IDD_IS_FUNCTION_AVAILABLE`, so on
+  older runtimes it is silently skipped (the OS keeps auto-selecting). This is why
+  the binary compiles against the 1.4 headers while the INF still binds `IddCx0102`.
+- Pinning by vendor id picks the first matching adapter; selecting between two GPUs
+  of the same vendor (by LUID/index) is a later enhancement.
+
+## 8. Logging
 
 - `OutputDebugString`-based tracing gated behind a debug flag, visible in DebugView.
 - Messages are ASCII only (no em/en dashes or arrows).
 - Log device add/remove, mode commits, IOCTL entry/exit with status, and IddCx
   callback transitions.
 
-## 8. Out of scope for v1
+## 9. Out of scope for v1
 
 - HDR and wide-gamut (requires a newer IddCx level and HDR metadata path).
 - Per-display custom/user mode lists.
 - Gamma/color management.
 
-## 9. Open items
+## 10. Open items
 
 - Frame delivery contract for the capture path (how the latest swap-chain frame is
   exposed to the host application) - to be specified alongside the host integration.

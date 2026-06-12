@@ -50,6 +50,12 @@ UmdfHostProcessSharing   = ProcessSharingDisabled
 UmdfLibraryVersion = 2.25.0
 ServiceBinary      = %12%\UMDF\VoidDisplay.dll
 UmdfExtensions     = IddCx0102
+AddReg             = VoidDisplay_Parameters_AddReg
+
+; Driver Parameters (WUDF service key). Operators may edit these post-install.
+;   PreferredRenderAdapterVendorId: 0=auto, 0x10DE=NVIDIA, 0x1002=AMD, 0x8086=Intel
+[VoidDisplay_Parameters_AddReg]
+HKR, Parameters, PreferredRenderAdapterVendorId, 0x00010001, 0
 
 [WUDFRD_ServiceInstall]
 DisplayName   = %WudfRdDisplayName%

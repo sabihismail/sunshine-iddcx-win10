@@ -28,6 +28,53 @@ static void FillTargetMode(IDDCX_TARGET_MODE& m, const VOID_MODE_DESC& d)
 }
 
 // ---------------------------------------------------------------------------
+// Preferred render GPU
+//
+// On a multi-GPU headless host the OS would otherwise auto-pick the adapter
+// that composes the virtual desktop. We let the operator pin it by DXGI vendor
+// id via the driver's Parameters key:
+//   HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\VoidDisplay\
+//        Parameters\PreferredRenderAdapterVendorId  (REG_DWORD)
+//   0 or absent = auto; 0x10DE = NVIDIA, 0x1002 = AMD, 0x8086 = Intel.
+// Returns true and fills outLuid if a matching adapter is found.
+// ---------------------------------------------------------------------------
+static bool VoidResolveRenderAdapterLuid(LUID* outLuid)
+{
+    DWORD vendorId = 0;
+    DWORD cb = sizeof(vendorId);
+    LSTATUS rs = RegGetValueW(
+        HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters",
+        L"PreferredRenderAdapterVendorId",
+        RRF_RT_REG_DWORD, nullptr, &vendorId, &cb);
+    if (rs != ERROR_SUCCESS || vendorId == 0) {
+        return false;  // auto
+    }
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+            desc.VendorId == vendorId &&
+            !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            *outLuid = desc.AdapterLuid;
+            VOID_LOG("Preferred render adapter: vendor 0x%04X -> LUID %ld:%lu",
+                     vendorId, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
+            return true;
+        }
+        adapter.Reset();
+    }
+
+    VOID_LOG("No DXGI adapter for preferred vendor 0x%04X; using auto", vendorId);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // DriverEntry / device add
 // ---------------------------------------------------------------------------
 EXTERN_C NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT pDriverObject,
@@ -387,6 +434,18 @@ void VoidDisplayDevice::FinishInit(IDDCX_ADAPTER adapter)
 {
     m_Adapter = adapter;
     VOID_LOG("Adapter init finished");
+
+    // Pin the render/parent GPU if configured. Best done before any monitor is
+    // added (monitors are created on-demand via IOCTL, so here is the right spot).
+    LUID luid = {};
+    if (VoidResolveRenderAdapterLuid(&luid) &&
+        IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)) {
+        IDARG_IN_ADAPTERSETRENDERADAPTER in = {};
+        in.PreferredRenderAdapter = luid;
+        IddCxAdapterSetRenderAdapter(m_Adapter, &in);
+        VOID_LOG("Pinned render adapter");
+    }
+
     // TODO: restore persisted displays from the registry here.
 }
 
