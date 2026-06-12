@@ -3,4 +3,6 @@
     <Platform Name="x64" />
   </Configurations>
   <Project Path="void-display/VoidDisplay.vcxproj" />
+  <Project Path="libvoidrv/libvoidrv.vcxproj" />
+  <Project Path="voidctl/voidctl.vcxproj" />
 </Solution>
