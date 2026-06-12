@@ -7,6 +7,12 @@ using namespace Microsoft::WRL;
 static const GUID kVoidContainerBase =
     { 0x61912c91, 0x979a, 0x40e7, { 0xb4, 0x2a, 0xab, 0xf6, 0xd9, 0x17, 0xbf, 0xf3 } };
 
+// The driver's WUDF service Parameters key - source of the operator-tunable
+// settings the driver reads at init (render adapter, custom modes, persisted
+// displays, hardware cursor). The UMDF host can read it but not write it.
+static const wchar_t kVoidParamsKey[] =
+    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters";
+
 // ---------------------------------------------------------------------------
 // Mode-list helpers
 // ---------------------------------------------------------------------------
@@ -383,12 +389,14 @@ void VoidDeviceContextWrapper::Cleanup()
 // VoidDisplayDevice
 // ---------------------------------------------------------------------------
 VoidDisplayDevice::VoidDisplayDevice(WDFDEVICE wdfDevice)
-    : m_WdfDevice(wdfDevice), m_Adapter(nullptr), m_Lock(nullptr), m_InitStarted(false)
+    : m_WdfDevice(wdfDevice), m_Adapter(nullptr), m_Lock(nullptr),
+      m_InitStarted(false), m_HardwareCursor(true)
 {
     for (UINT32 i = 0; i < VOIDDISPLAY_MAX_DISPLAYS; ++i) {
-        m_Slots[i].InUse   = false;
-        m_Slots[i].Mode    = VOIDDISPLAY_MODE{};
-        m_Slots[i].Monitor = nullptr;
+        m_Slots[i].InUse       = false;
+        m_Slots[i].Mode        = VOIDDISPLAY_MODE{};
+        m_Slots[i].Monitor     = nullptr;
+        m_Slots[i].CursorEvent = nullptr;
     }
 
     WDF_OBJECT_ATTRIBUTES attr;
@@ -468,6 +476,17 @@ void VoidDisplayDevice::FinishInit(IDDCX_ADAPTER adapter)
         IddCxAdapterSetRenderAdapter(m_Adapter, &in);
         VOID_LOG("Pinned render adapter");
     }
+
+    // Hardware cursor: on by default. With a hardware-cursor plane the OS draws
+    // the pointer as an overlay instead of compositing it into the captured
+    // frames, so remote-desktop apps that render their own client-side cursor do
+    // not show a double pointer. Set HardwareCursorEnabled=0 to bake the cursor
+    // into the frames instead (server-side cursor).
+    DWORD hwc = 1;
+    DWORD hwcb = sizeof(hwc);
+    RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"HardwareCursorEnabled",
+                 RRF_RT_REG_DWORD, NULL, &hwc, &hwcb);
+    m_HardwareCursor = (hwc != 0);
 
     // Seed any SDK-persisted custom modes so they are advertised the moment a
     // monitor arrives (survives device restart / reboot). Defaults are always
@@ -583,6 +602,10 @@ NTSTATUS VoidDisplayDevice::RemoveMonitor(UINT32 index)
         processor = std::move(m_Slots[index].Processor);
         m_Slots[index].Monitor = nullptr;
         m_Slots[index].InUse   = false;
+        if (m_Slots[index].CursorEvent) {
+            CloseHandle(m_Slots[index].CursorEvent);
+            m_Slots[index].CursorEvent = nullptr;
+        }
     }
     WdfWaitLockRelease(m_Lock);
 
@@ -641,9 +664,6 @@ struct VoidPersistEntry
     UINT32 Height;
     UINT32 RefreshHz;
 };
-
-static const wchar_t kVoidParamsKey[] =
-    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters";
 
 // Recreate displays the SDK persisted to the Parameters key. Called once at
 // adapter init,
@@ -742,6 +762,40 @@ void VoidDisplayDevice::AssignSwapChain(UINT32 index, IDDCX_SWAPCHAIN swapChain,
             m_Slots[index].Processor =
                 std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent);
             VOID_LOG("SwapChain processor started for slot %u", index);
+
+            // Expose a hardware-cursor plane so the OS does not bake the pointer
+            // into the swap-chain frames (avoids a double cursor on remote-desktop
+            // apps that draw their own client-side pointer). Each monitor gets its
+            // own unnamed data-available event. Available since IddCx 1.0, so no
+            // version guard is needed.
+            if (m_HardwareCursor) {
+                if (m_Slots[index].CursorEvent) {
+                    CloseHandle(m_Slots[index].CursorEvent);
+                    m_Slots[index].CursorEvent = nullptr;
+                }
+                HANDLE cursorEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (cursorEvent) {
+                    IDDCX_CURSOR_CAPS caps = {};
+                    caps.Size                  = sizeof(caps);
+                    caps.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL;
+                    caps.AlphaCursorSupport    = TRUE;
+                    caps.MaxX                  = 256;   // covers high-DPI pointers
+                    caps.MaxY                  = 256;
+
+                    IDARG_IN_SETUP_HWCURSOR in = {};
+                    in.CursorInfo              = caps;
+                    in.hNewCursorDataAvailable = cursorEvent;
+
+                    NTSTATUS cs = IddCxMonitorSetupHardwareCursor(m_Slots[index].Monitor, &in);
+                    if (NT_SUCCESS(cs)) {
+                        m_Slots[index].CursorEvent = cursorEvent;
+                        VOID_LOG("Hardware cursor enabled for slot %u", index);
+                    } else {
+                        CloseHandle(cursorEvent);
+                        VOID_LOG("SetupHardwareCursor slot %u failed 0x%08X", index, cs);
+                    }
+                }
+            }
         } else {
             VOID_LOG("Direct3DDevice Init failed for slot %u hr=0x%08X", index, hr);
         }
@@ -754,6 +808,10 @@ void VoidDisplayDevice::UnassignSwapChain(UINT32 index)
     WdfWaitLockAcquire(m_Lock, NULL);
     if (index < VOIDDISPLAY_MAX_DISPLAYS) {
         m_Slots[index].Processor.reset();
+        if (m_Slots[index].CursorEvent) {
+            CloseHandle(m_Slots[index].CursorEvent);
+            m_Slots[index].CursorEvent = nullptr;
+        }
     }
     WdfWaitLockRelease(m_Lock);
 }

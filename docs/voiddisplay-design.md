@@ -238,20 +238,40 @@ a cross-adapter copy.
 - Pinning by vendor id picks the first matching adapter; selecting between two GPUs
   of the same vendor (by LUID/index) is a later enhancement.
 
-## 8. Logging
+## 8. Hardware cursor
+
+Each monitor exposes a hardware-cursor plane so the OS draws the mouse pointer as
+an overlay rather than compositing it into the swap-chain image.
+
+- On swap-chain assign, the driver calls `IddCxMonitorSetupHardwareCursor` with an
+  `IDDCX_CURSOR_CAPS` (alpha + full color-XOR support, 256x256 max) and a per-monitor
+  data-available event. Available since IddCx 1.0, so no runtime version guard.
+- This keeps the captured desktop image pointer-free, which matters for streaming:
+  remote-desktop clients that render their own cursor (the common low-latency design)
+  otherwise show a double pointer - one baked into the stream and one drawn by the
+  client. With the hardware-cursor plane the stream carries none, leaving only the
+  client's.
+- On by default; `HardwareCursorEnabled=0` (REG_DWORD under the service Parameters
+  key) bakes the pointer into the frames instead (server-side cursor).
+- The data-available event lets the capture path later query the cursor shape and
+  position (`IddCxMonitorQueryHardwareCursor`) for a server-side-cursor mode; v1 only
+  sets the plane up so the pointer stays out of the image. Each monitor uses its own
+  unnamed event (a single shared event would collide across monitors).
+
+## 9. Logging
 
 - `OutputDebugString`-based tracing gated behind a debug flag, visible in DebugView.
 - Messages are ASCII only (no em/en dashes or arrows).
 - Log device add/remove, mode commits, IOCTL entry/exit with status, and IddCx
   callback transitions.
 
-## 9. Out of scope for v1
+## 10. Out of scope for v1
 
 - HDR and wide-gamut (requires a newer IddCx level and HDR metadata path).
 - Per-display custom/user mode lists.
 - Gamma/color management.
 
-## 10. Open items
+## 11. Open items
 
 - Frame delivery contract for the capture path (how the latest swap-chain frame is
   exposed to the host application) - to be specified alongside the host integration.

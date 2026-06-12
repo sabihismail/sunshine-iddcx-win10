@@ -80,6 +80,7 @@ struct VoidDisplaySlot
     VOIDDISPLAY_MODE                    Mode;
     IDDCX_MONITOR                       Monitor;
     std::unique_ptr<SwapChainProcessor> Processor;
+    HANDLE                              CursorEvent;   // hardware-cursor data-available event
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +119,7 @@ private:
     IDDCX_ADAPTER   m_Adapter;
     WDFWAITLOCK     m_Lock;
     bool            m_InitStarted;
+    bool            m_HardwareCursor;   // expose a hardware-cursor plane (no baked-in pointer)
     VoidDisplaySlot m_Slots[VOIDDISPLAY_MAX_DISPLAYS];
 };
 
