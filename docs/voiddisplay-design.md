@@ -129,27 +129,54 @@ Semantics:
   settings. `LIST_MODES` returns the full advertised list (defaults + custom).
 - The advertised list is a process-global store (the `ParseMonitorDescription`
   callback has no per-monitor context), so custom modes apply to every VoidDisplay
-  monitor. They are in-memory for now; durable registry persistence (written by the
-  admin-side SDK, read by the driver at init) is a follow-up.
+  monitor. Custom modes are durable: the SDK mirrors each `ADD_MODE`/`REMOVE_MODE`
+  into a `CustomModes` value (REG_BINARY array of packed `{Width, Height, RefreshHz}`
+  triples) under the driver's WUDF service `Parameters` key, and the driver re-reads
+  it at adapter init, so they survive a device restart or reboot. The IOCTL changes
+  the live list; the registry write (which needs elevation) is best-effort and does
+  not affect the live change. Built-in defaults are always advertised and are never
+  written to the registry.
 - No `UPDATE`/ping code exists, by design.
 
 ## 4. Default mode set
 
-Advertised on every monitor unless restricted. Default mode is 1920x1080 at 60 Hz.
+Advertised on every monitor unless restricted. Default mode is 1920x1080 at 60 Hz
+(reported as the preferred mode). Wide-gamut resolutions carry a 60/120/144/165 Hz
+refresh ladder; 3:2 and laptop-panel resolutions are 60 Hz only.
 
-| Resolution | Aspect | Refresh (Hz) |
-|------------|--------|--------------|
-| 1280 x 720  | 16:9  | 60 |
-| 1600 x 900  | 16:9  | 60 |
-| 1920 x 1080 | 16:9  | 60, 120, 144, 240 |
-| 1920 x 1200 | 16:10 | 60 |
-| 2560 x 1440 | 16:9  | 60, 120, 144, 240 |
-| 2560 x 1600 | 16:10 | 60 |
-| 3440 x 1440 | 21:9  | 60, 100, 144 |
-| 3840 x 2160 | 16:9  | 60, 120, 144 |
+| Resolution  | Aspect           | Refresh ladder (Hz) |
+|-------------|------------------|---------------------|
+| 4096 x 2160 | DCI 4K (256:135) | 60/120/144/165 |
+| 3840 x 2160 | 16:9             | 60/120/144/165 |
+| 3840 x 1600 | 24:10            | 60/120/144/165 |
+| 3840 x 1080 | 32:9             | 60/120/144/165 |
+| 3440 x 1440 | 21:9             | 60/120/144/165 |
+| 2560 x 1080 | 21:9             | 60/120/144/165 |
+| 3200 x 1800 | 16:9             | 60/120/144/165 |
+| 2880 x 1620 | 16:9             | 60/120/144/165 |
+| 2560 x 1600 | 16:10            | 60/120/144/165 |
+| 2560 x 1440 | 16:9             | 60/120/144/165 |
+| 2048 x 1152 | 16:9             | 60/120/144/165 |
+| 1920 x 1200 | 16:10            | 60/120/144/165 |
+| 1920 x 1080 | 16:9             | 60/120/144/165 |
+| 1680 x 1050 | 16:10            | 60/120/144/165 |
+| 1600 x 1200 | 4:3              | 60/120/144/165 |
+| 1600 x 900  | 16:9             | 60/120/144/165 |
+| 1440 x 900  | 16:10            | 60/120/144/165 |
+| 1366 x 768  | 16:9             | 60/120/144/165 |
+| 1280 x 800  | 16:10            | 60/120/144/165 |
+| 1280 x 720  | 16:9             | 60/120/144/165 |
+| 3240 x 2160 | 3:2              | 60 |
+| 3000 x 2000 | 3:2              | 60 |
+| 2880 x 1800 | 16:10            | 60 |
+| 2736 x 1824 | 3:2              | 60 |
+| 2496 x 1664 | 3:2              | 60 |
+| 2256 x 1504 | 3:2              | 60 |
+| 1800 x 1200 | 3:2              | 60 |
 
-The set is a compiled-in table; per-display restriction and user-defined modes are a
-later enhancement.
+That is 87 advertised modes. The set is compiled in (`g_VoidDefaultModes`); callers
+add their own resolutions at runtime with `ADD_MODE` (section 3), which persist
+across restarts. Per-display restriction is a later enhancement.
 
 ## 5. EDID
 

@@ -469,6 +469,11 @@ void VoidDisplayDevice::FinishInit(IDDCX_ADAPTER adapter)
         VOID_LOG("Pinned render adapter");
     }
 
+    // Seed any SDK-persisted custom modes so they are advertised the moment a
+    // monitor arrives (survives device restart / reboot). Defaults are always
+    // present; this only adds user-defined extras.
+    VoidModesLoadPersisted();
+
     // TODO: restore persisted displays from the registry here.
 }
 

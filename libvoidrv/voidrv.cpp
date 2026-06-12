@@ -13,6 +13,7 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 struct VoidrvDisplay {
     HANDLE Device;
@@ -256,6 +257,53 @@ bool VoidrvDisplayList(VoidrvDisplayHandle handle, VoidrvDisplayState* state)
     return true;
 }
 
+// The driver re-reads its custom-mode list from this key at adapter init, so the
+// IOCTL only changes the live list - we mirror the change here for persistence.
+static const wchar_t kVoidParamsKey[] =
+    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters";
+
+// Mirror a custom-mode add/remove into the driver's Parameters key so it survives
+// a device restart / reboot. Stored as a REG_BINARY array of packed
+// VoidrvDisplayMode triples. Best-effort: writing HKLM needs elevation, and a
+// failure here does not undo the live (IOCTL) change.
+static void PersistCustomMode(const VoidrvDisplayMode* mode, bool add)
+{
+    VoidrvDisplayMode list[VOIDRV_MAX_MODES];
+    DWORD cb = sizeof(list);
+    DWORD count = 0;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"CustomModes",
+                     RRF_RT_REG_BINARY, nullptr, list, &cb) == ERROR_SUCCESS) {
+        count = cb / (DWORD)sizeof(VoidrvDisplayMode);
+    }
+
+    DWORD found = count;
+    for (DWORD i = 0; i < count; ++i) {
+        if (list[i].Width == mode->Width && list[i].Height == mode->Height &&
+            list[i].RefreshHz == mode->RefreshHz) {
+            found = i;
+            break;
+        }
+    }
+
+    if (add) {
+        if (found != count || count >= VOIDRV_MAX_MODES) {
+            return;  // already present, or full
+        }
+        list[count++] = *mode;
+    } else {
+        if (found == count) {
+            return;  // not present
+        }
+        for (DWORD i = found + 1; i < count; ++i) {
+            list[i - 1] = list[i];
+        }
+        --count;
+    }
+
+    RegSetKeyValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"CustomModes",
+                    REG_BINARY, list, count * (DWORD)sizeof(VoidrvDisplayMode));
+}
+
 bool VoidrvDisplayAddMode(VoidrvDisplayHandle handle, const VoidrvDisplayMode* mode)
 {
     if (!handle || !mode) {
@@ -266,7 +314,11 @@ bool VoidrvDisplayAddMode(VoidrvDisplayHandle handle, const VoidrvDisplayMode* m
     wire.Width = mode->Width;
     wire.Height = mode->Height;
     wire.RefreshHz = mode->RefreshHz;
-    return Control(handle->Device, IOCTL_VOIDDISPLAY_ADD_MODE, &wire, sizeof(wire), nullptr, 0, nullptr);
+    if (!Control(handle->Device, IOCTL_VOIDDISPLAY_ADD_MODE, &wire, sizeof(wire), nullptr, 0, nullptr)) {
+        return false;
+    }
+    PersistCustomMode(mode, true);
+    return true;
 }
 
 bool VoidrvDisplayRemoveMode(VoidrvDisplayHandle handle, const VoidrvDisplayMode* mode)
@@ -279,7 +331,11 @@ bool VoidrvDisplayRemoveMode(VoidrvDisplayHandle handle, const VoidrvDisplayMode
     wire.Width = mode->Width;
     wire.Height = mode->Height;
     wire.RefreshHz = mode->RefreshHz;
-    return Control(handle->Device, IOCTL_VOIDDISPLAY_REMOVE_MODE, &wire, sizeof(wire), nullptr, 0, nullptr);
+    if (!Control(handle->Device, IOCTL_VOIDDISPLAY_REMOVE_MODE, &wire, sizeof(wire), nullptr, 0, nullptr)) {
+        return false;
+    }
+    PersistCustomMode(mode, false);
+    return true;
 }
 
 bool VoidrvDisplayListModes(VoidrvDisplayHandle handle, VoidrvModeList* list)

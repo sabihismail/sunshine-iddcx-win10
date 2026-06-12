@@ -58,3 +58,8 @@ unsigned VoidModesGet(VOID_MODE_DESC* out, unsigned cap);
 
 /* Total advertised mode count (defaults + custom). */
 unsigned VoidModesCount(void);
+
+/* Seed the custom-mode store from the SDK-persisted list in the driver's WUDF
+ * service Parameters key (REG_BINARY of packed {w, h, hz} triples). Call once at
+ * adapter init, before the first monitor arrives. No-op if nothing is persisted. */
+void VoidModesLoadPersisted(void);

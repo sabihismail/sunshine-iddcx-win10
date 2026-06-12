@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 #define VOIDRV_MAX_DISPLAYS 8
-#define VOIDRV_MAX_MODES    64
+#define VOIDRV_MAX_MODES    128
 
 typedef struct VoidrvDisplayMode {
     uint32_t Width;      /* pixels; 0 in an Add request selects the driver default */
