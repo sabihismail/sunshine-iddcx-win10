@@ -112,8 +112,6 @@ public:
 
 private:
     NTSTATUS CreateMonitorLocked(UINT32 index, const VOIDDISPLAY_MODE& mode);
-    void     DestroyMonitorLocked(UINT32 index);
-    void     ReplugAllMonitors();   // re-arrive live monitors after a mode-list change
 
     WDFDEVICE       m_WdfDevice;
     IDDCX_ADAPTER   m_Adapter;

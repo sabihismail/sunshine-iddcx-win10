@@ -529,26 +529,6 @@ NTSTATUS VoidDisplayDevice::CreateMonitorLocked(UINT32 index, const VOIDDISPLAY_
     return STATUS_SUCCESS;
 }
 
-void VoidDisplayDevice::DestroyMonitorLocked(UINT32 index)
-{
-    if (!m_Slots[index].InUse) {
-        return;
-    }
-
-    m_Slots[index].Processor.reset();  // stop frame processing first
-
-    if (m_Slots[index].Monitor) {
-        NTSTATUS status = IddCxMonitorDeparture(m_Slots[index].Monitor);
-        if (!NT_SUCCESS(status)) {
-            VOID_LOG("IddCxMonitorDeparture slot %u failed 0x%08X", index, status);
-        }
-    }
-
-    m_Slots[index].Monitor = nullptr;
-    m_Slots[index].InUse   = false;
-    VOID_LOG("Monitor removed slot %u", index);
-}
-
 NTSTATUS VoidDisplayDevice::AddMonitor(const VOIDDISPLAY_MODE& mode, UINT32* outIndex)
 {
     VOIDDISPLAY_MODE m = mode;
@@ -585,9 +565,28 @@ NTSTATUS VoidDisplayDevice::RemoveMonitor(UINT32 index)
     if (index >= VOIDDISPLAY_MAX_DISPLAYS) {
         return STATUS_INVALID_PARAMETER;
     }
+
+    IDDCX_MONITOR monitor = nullptr;
+    std::unique_ptr<SwapChainProcessor> processor;
+
     WdfWaitLockAcquire(m_Lock, NULL);
-    DestroyMonitorLocked(index);
+    if (m_Slots[index].InUse) {
+        monitor   = m_Slots[index].Monitor;
+        processor = std::move(m_Slots[index].Processor);
+        m_Slots[index].Monitor = nullptr;
+        m_Slots[index].InUse   = false;
+    }
     WdfWaitLockRelease(m_Lock);
+
+    // Tear down OUTSIDE the lock: joining the swap-chain thread and
+    // IddCxMonitorDeparture can both re-enter EvtIddCxMonitorUnassignSwapChain,
+    // which takes m_Lock - holding it here deadlocks until the OS times out
+    // (the cause of the ~2-3s "remove failed").
+    processor.reset();
+    if (monitor) {
+        IddCxMonitorDeparture(monitor);
+    }
+    VOID_LOG("Monitor removed slot %u", index);
     return STATUS_SUCCESS;
 }
 
@@ -623,28 +622,14 @@ void VoidDisplayDevice::GetState(VOIDDISPLAY_STATE* out)
     WdfWaitLockRelease(m_Lock);
 }
 
-void VoidDisplayDevice::ReplugAllMonitors()
-{
-    // The advertised mode list changed; re-arrive each live monitor so the OS
-    // re-queries ParseMonitorDescription / QueryTargetModes and picks up the
-    // new modes. Brief disconnect per monitor is acceptable for a config op.
-    WdfWaitLockAcquire(m_Lock, NULL);
-    for (UINT32 i = 0; i < VOIDDISPLAY_MAX_DISPLAYS; ++i) {
-        if (m_Slots[i].InUse) {
-            VOIDDISPLAY_MODE mode = m_Slots[i].Mode;
-            DestroyMonitorLocked(i);
-            CreateMonitorLocked(i, mode);
-        }
-    }
-    WdfWaitLockRelease(m_Lock);
-}
-
 NTSTATUS VoidDisplayDevice::AddMode(const VOIDDISPLAY_MODE& mode)
 {
     if (!VoidModesAdd(mode.Width, mode.Height, mode.RefreshHz)) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    ReplugAllMonitors();
+    // Applies to displays added afterward (and existing ones on re-add). We do
+    // not re-plug live monitors: it is disruptive and resets the Windows 10
+    // per-combination topology (see parsec-vdd issue #23).
     VOID_LOG("Added custom mode %ux%u@%u", mode.Width, mode.Height, mode.RefreshHz);
     return STATUS_SUCCESS;
 }
@@ -654,7 +639,6 @@ NTSTATUS VoidDisplayDevice::RemoveMode(const VOIDDISPLAY_MODE& mode)
     if (!VoidModesRemove(mode.Width, mode.Height, mode.RefreshHz)) {
         return STATUS_NOT_FOUND;  // not a custom mode (defaults cannot be removed)
     }
-    ReplugAllMonitors();
     VOID_LOG("Removed custom mode %ux%u@%u", mode.Width, mode.Height, mode.RefreshHz);
     return STATUS_SUCCESS;
 }
