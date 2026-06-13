@@ -30,15 +30,25 @@ EXTERN_C_START
 
 #define VOIDINPUT_POOL_TAG 'nIoV'
 
+struct _VOIDINPUT_DEVICE_CONTEXT;
+
 // Per-handle context: one virtual HID device.
 typedef struct _VOIDINPUT_FILE_CONTEXT {
     WDFFILEOBJECT FileObject;
+    struct _VOIDINPUT_DEVICE_CONTEXT* DeviceContext;
     WDFIOTARGET   VhfIoTarget;       // the lower VHF device, opened by file
     VHF_CONFIG    VhfConfig;         // filled from the device type at CREATE
     VHFHANDLE     VhfHandle;         // non-null once the device is created
     VOIDINPUT_DEVICE_TYPE Type;      // VoidInputDeviceNone until created
     BOOLEAN       NumberedReports;   // the device's reports carry a report-id byte
     LONG          LiveIndex;         // owned slot in the driver live table, -1 if none
+
+    // Output/feature event channel (device -> host). VHF async operations are
+    // queued here as they arrive and drained by IOCTL_VOIDINPUT_GET_EVENT.
+    WDFWAITLOCK   EventLock;         // guards the two collections below
+    WDFCOLLECTION WaitingEvents;     // queued, not yet handed to a GET_EVENT
+    WDFCOLLECTION OutstandingEvents; // handed out, awaiting COMPLETE_EVENT
+    LONG          NextRequestId;
 } VOIDINPUT_FILE_CONTEXT, *PVOIDINPUT_FILE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VOIDINPUT_FILE_CONTEXT, VoidInputFileGetContext)
 
@@ -53,10 +63,20 @@ typedef struct _VOIDINPUT_LIVE_SLOT {
 // Driver-wide device context: tracks the live device set for capacity + LIST.
 typedef struct _VOIDINPUT_DEVICE_CONTEXT {
     WDFDEVICE           Device;
-    WDFWAITLOCK         Lock;        // guards the slot table below
+    WDFQUEUE            GetEventQueue;   // manual queue for pended GET_EVENT requests
+    WDFWAITLOCK         Lock;            // guards the slot table below
     VOIDINPUT_LIVE_SLOT Slots[VOIDINPUT_MAX_DEVICES];
 } VOIDINPUT_DEVICE_CONTEXT, *PVOIDINPUT_DEVICE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VOIDINPUT_DEVICE_CONTEXT, VoidInputDeviceGetContext)
+
+// One queued VHF async operation (an output/feature request from the OS).
+typedef struct _VOIDINPUT_OP_CONTEXT {
+    VOIDINPUT_EVENT_TYPE Type;
+    ULONG                RequestId;
+    VHFOPERATIONHANDLE   VhfOp;
+    HID_XFER_PACKET      Packet;      // shallow copy; the data buffer lives until we complete
+} VOIDINPUT_OP_CONTEXT, *PVOIDINPUT_OP_CONTEXT;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VOIDINPUT_OP_CONTEXT, VoidInputOpGetContext)
 
 EXTERN_C_END
 

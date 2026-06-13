@@ -152,6 +152,147 @@ static const UCHAR k_KeyboardReportDescriptor[] = {
 };
 
 // ---------------------------------------------------------------------------
+// Xbox One game pad (HID form)
+//
+// A single (un-numbered) input report and one force-feedback output report:
+//   input  (17 bytes): X/Y/Rx/Ry as 16-bit sticks (0x8000 centered), Z/Rz as
+//           10-bit triggers, 10 buttons, a 4-bit hat, a system-menu bit, and a
+//           battery byte.
+//   output (8 bytes): PID-page rumble - an enable nibble, four 8-bit motor
+//           magnitudes (left/right + left/right trigger), duration, delay, loop.
+// Visible to DirectInput / Windows.Gaming.Input / Steam Input (not XInput/xusb).
+// ---------------------------------------------------------------------------
+static const UCHAR k_XboxOneReportDescriptor[] = {
+    0x05, 0x01,                    // Usage Page (Generic Desktop)
+    0x09, 0x05,                    // Usage (Game Pad)
+    0xA1, 0x01,                    // Collection (Application)
+    0xA1, 0x00,                    //   Collection (Physical)
+    0x09, 0x30,                    //     Usage (X)
+    0x09, 0x31,                    //     Usage (Y)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x27, 0xFF, 0xFF, 0x00, 0x00,  //     Logical Maximum (65535)
+    0x95, 0x02,                    //     Report Count (2)
+    0x75, 0x10,                    //     Report Size (16)
+    0x81, 0x02,                    //     Input (Data,Var,Abs)        ; left stick
+    0xC0,                          //   End Collection
+    0xA1, 0x00,                    //   Collection (Physical)
+    0x09, 0x33,                    //     Usage (Rx)
+    0x09, 0x34,                    //     Usage (Ry)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x27, 0xFF, 0xFF, 0x00, 0x00,  //     Logical Maximum (65535)
+    0x95, 0x02,                    //     Report Count (2)
+    0x75, 0x10,                    //     Report Size (16)
+    0x81, 0x02,                    //     Input (Data,Var,Abs)        ; right stick
+    0xC0,                          //   End Collection
+    0x05, 0x01,                    //   Usage Page (Generic Desktop)
+    0x09, 0x32,                    //   Usage (Z)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x03,              //   Logical Maximum (1023)
+    0x95, 0x01,                    //   Report Count (1)
+    0x75, 0x0A,                    //   Report Size (10)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)          ; left trigger
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x00,                    //   Logical Maximum (0)
+    0x75, 0x06,                    //   Report Size (6)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x03,                    //   Input (Const,Var,Abs)         ; 6-bit pad
+    0x05, 0x01,                    //   Usage Page (Generic Desktop)
+    0x09, 0x35,                    //   Usage (Rz)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x03,              //   Logical Maximum (1023)
+    0x95, 0x01,                    //   Report Count (1)
+    0x75, 0x0A,                    //   Report Size (10)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)          ; right trigger
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x00,                    //   Logical Maximum (0)
+    0x75, 0x06,                    //   Report Size (6)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x03,                    //   Input (Const,Var,Abs)         ; 6-bit pad
+    0x05, 0x09,                    //   Usage Page (Button)
+    0x19, 0x01,                    //   Usage Minimum (Button 1)
+    0x29, 0x0A,                    //   Usage Maximum (Button 10)
+    0x95, 0x0A,                    //   Report Count (10)
+    0x75, 0x01,                    //   Report Size (1)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)          ; 10 buttons
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x00,                    //   Logical Maximum (0)
+    0x75, 0x06,                    //   Report Size (6)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x03,                    //   Input (Const,Var,Abs)         ; 6-bit pad
+    0x05, 0x01,                    //   Usage Page (Generic Desktop)
+    0x09, 0x39,                    //   Usage (Hat switch)
+    0x15, 0x01,                    //   Logical Minimum (1)
+    0x25, 0x08,                    //   Logical Maximum (8)
+    0x35, 0x00,                    //   Physical Minimum (0)
+    0x46, 0x3B, 0x01,              //   Physical Maximum (315)
+    0x66, 0x14, 0x00,              //   Unit (English Rotation: deg)
+    0x75, 0x04,                    //   Report Size (4)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x42,                    //   Input (Data,Var,Abs,Null State); D-pad hat
+    0x75, 0x04,                    //   Report Size (4)
+    0x95, 0x01,                    //   Report Count (1)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x00,                    //   Logical Maximum (0)
+    0x35, 0x00,                    //   Physical Minimum (0)
+    0x45, 0x00,                    //   Physical Maximum (0)
+    0x65, 0x00,                    //   Unit (None)
+    0x81, 0x03,                    //   Input (Const,Var,Abs)         ; 4-bit pad
+    0xA1, 0x02,                    //   Collection (Logical)          ; rumble output
+    0x05, 0x0F,                    //     Usage Page (PID)
+    0x09, 0x97,                    //     Usage (DC Enable Actuators)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x01,                    //     Logical Maximum (1)
+    0x75, 0x04,                    //     Report Size (4)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)       ; enable nibble
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x00,                    //     Logical Maximum (0)
+    0x91, 0x03,                    //     Output (Const,Var,Abs)      ; 4-bit pad
+    0x09, 0x70,                    //     Usage (Magnitude)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x64,                    //     Logical Maximum (100)
+    0x75, 0x08,                    //     Report Size (8)
+    0x95, 0x04,                    //     Report Count (4)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)       ; 4 motor magnitudes
+    0x09, 0x50,                    //     Usage (Duration)
+    0x66, 0x01, 0x10,              //     Unit (SI Linear: s)
+    0x55, 0x0E,                    //     Unit Exponent (-2)
+    0x26, 0xFF, 0x00,              //     Logical Maximum (255)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)       ; duration
+    0x09, 0xA7,                    //     Usage (Start Delay)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)       ; delay
+    0x65, 0x00,                    //     Unit (None)
+    0x55, 0x00,                    //     Unit Exponent (0)
+    0x09, 0x7C,                    //     Usage (Loop Count)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)       ; loop count
+    0xC0,                          //   End Collection
+    0x05, 0x01,                    //   Usage Page (Generic Desktop)
+    0x09, 0x80,                    //   Usage (System Control)
+    0xA1, 0x00,                    //   Collection (Physical)
+    0x09, 0x85,                    //     Usage (System Main Menu)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x01,                    //     Logical Maximum (1)
+    0x95, 0x01,                    //     Report Count (1)
+    0x75, 0x01,                    //     Report Size (1)
+    0x81, 0x02,                    //     Input (Data,Var,Abs)        ; guide button
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x00,                    //     Logical Maximum (0)
+    0x75, 0x07,                    //     Report Size (7)
+    0x95, 0x01,                    //     Report Count (1)
+    0x81, 0x03,                    //     Input (Const,Var,Abs)       ; 7-bit pad
+    0xC0,                          //   End Collection
+    0x05, 0x06,                    //   Usage Page (Generic Device Controls)
+    0x09, 0x20,                    //   Usage (Battery Strength)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,              //   Logical Maximum (255)
+    0x75, 0x08,                    //   Report Size (8)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)          ; battery
+    0xC0,                          // End Collection
+};
+
+// ---------------------------------------------------------------------------
 // Registry. Types absent here return NULL from VoidInputGetDeviceDesc and so
 // fail CREATE with STATUS_NOT_SUPPORTED until their milestone lands.
 // ---------------------------------------------------------------------------
@@ -175,6 +316,16 @@ static const VOIDINPUT_DEVICE_DESC k_Devices[] = {
         TRUE,                          // singleton
         FALSE,                         // not a gamepad
         VOIDINPUT_EVT_NONE,            // input-only (lock-LED output is a later milestone)
+    },
+    {
+        VoidInputDeviceXboxOne,
+        0x045E, 0x0B13, 0x0100,        // Xbox wireless controller (HID/BLE form)
+        k_XboxOneReportDescriptor,
+        (USHORT)sizeof(k_XboxOneReportDescriptor),
+        FALSE,                         // single un-numbered input report
+        FALSE,                         // not a singleton (up to 4 pads)
+        TRUE,                          // gamepad (counts against the 4-pad cap)
+        VOIDINPUT_EVT_WRITE_REPORT,    // force-feedback output report
     },
 };
 

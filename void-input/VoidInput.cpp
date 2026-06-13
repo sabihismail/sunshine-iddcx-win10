@@ -14,6 +14,171 @@ static BOOLEAN VoidInputIsGamepadType(VOIDINPUT_DEVICE_TYPE type)
 }
 
 // ---------------------------------------------------------------------------
+// Output/feature event channel (device -> host)
+//
+// VHF invokes our async-operation callback when the OS sends an output report
+// (e.g. gamepad rumble) or a feature request. We wrap it as an event, queue it,
+// and hand it to a pending IOCTL_VOIDINPUT_GET_EVENT; the host services it and
+// calls IOCTL_VOIDINPUT_COMPLETE_EVENT, which completes the VHF operation.
+// ---------------------------------------------------------------------------
+
+#define VOIDINPUT_MAX_WAITING_EVENTS 8   // drop-oldest cap if the host never reads
+
+// Satisfy a GET_EVENT request from the head of the waiting queue. Returns TRUE
+// if the request was completed (success or error), FALSE if nothing was waiting
+// (the caller should then pend the request).
+static BOOLEAN VoidInputTryCompleteGetEvent(PVOIDINPUT_FILE_CONTEXT fc, WDFREQUEST Request)
+{
+    WdfWaitLockAcquire(fc->EventLock, NULL);
+
+    WDFOBJECT op = WdfCollectionGetFirstItem(fc->WaitingEvents);
+    if (!op) {
+        WdfWaitLockRelease(fc->EventLock);
+        return FALSE;
+    }
+    auto* oc = VoidInputOpGetContext(op);
+
+    VOIDINPUT_EVENT* out = nullptr;
+    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID*)&out, nullptr);
+    if (!NT_SUCCESS(status)) {
+        WdfWaitLockRelease(fc->EventLock);
+        WdfRequestComplete(Request, status);
+        return TRUE;
+    }
+
+    ULONG len = oc->Packet.reportBufferLen;
+    if (len > VOIDINPUT_MAX_REPORT) {
+        len = VOIDINPUT_MAX_REPORT;
+    }
+    RtlZeroMemory(out, sizeof(*out));
+    out->Type       = (UINT32)oc->Type;
+    out->RequestId  = oc->RequestId;
+    out->ReportId   = oc->Packet.reportId;
+    out->DataLength = len;
+    if (len && oc->Packet.reportBuffer) {
+        RtlCopyMemory(out->Data, oc->Packet.reportBuffer, len);
+    }
+
+    status = WdfCollectionAdd(fc->OutstandingEvents, op);
+    if (NT_SUCCESS(status)) {
+        WdfCollectionRemove(fc->WaitingEvents, op);
+        WdfWaitLockRelease(fc->EventLock);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
+        return TRUE;
+    }
+
+    // Could not move it to outstanding; fail the VHF op and drop it.
+    WdfCollectionRemove(fc->WaitingEvents, op);
+    WdfWaitLockRelease(fc->EventLock);
+    if (oc->VhfOp) { VhfAsyncOperationComplete(oc->VhfOp, status); }
+    WdfObjectDelete(op);
+    WdfRequestComplete(Request, status);
+    return TRUE;
+}
+
+// Queue a VHF async operation as an event, then try to dispatch it immediately.
+static VOID VoidInputDispatchEvent(PVOIDINPUT_FILE_CONTEXT fc, VHFOPERATIONHANDLE vhfOp,
+                                   PHID_XFER_PACKET packet, VOIDINPUT_EVENT_TYPE type)
+{
+    WDF_OBJECT_ATTRIBUTES attr;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, VOIDINPUT_OP_CONTEXT);
+    attr.ParentObject = fc->FileObject;
+
+    WDFOBJECT op = nullptr;
+    NTSTATUS status = WdfObjectCreate(&attr, &op);
+    if (!NT_SUCCESS(status)) {
+        if (vhfOp) { VhfAsyncOperationComplete(vhfOp, STATUS_INSUFFICIENT_RESOURCES); }
+        return;
+    }
+    auto* oc = VoidInputOpGetContext(op);
+    oc->Type      = type;
+    oc->VhfOp     = vhfOp;
+    oc->RequestId = (ULONG)InterlockedIncrement(&fc->NextRequestId);
+    oc->Packet    = packet ? *packet : HID_XFER_PACKET{};
+
+    WdfWaitLockAcquire(fc->EventLock, NULL);
+    if (!fc->VhfHandle) {            // device is tearing down
+        WdfWaitLockRelease(fc->EventLock);
+        if (vhfOp) { VhfAsyncOperationComplete(vhfOp, STATUS_DEVICE_REMOVED); }
+        WdfObjectDelete(op);
+        return;
+    }
+    status = WdfCollectionAdd(fc->WaitingEvents, op);
+    if (!NT_SUCCESS(status)) {
+        WdfWaitLockRelease(fc->EventLock);
+        if (vhfOp) { VhfAsyncOperationComplete(vhfOp, status); }
+        WdfObjectDelete(op);
+        return;
+    }
+    // Bound the queue if the host is not reading events: drop the oldest.
+    while (WdfCollectionGetCount(fc->WaitingEvents) > VOIDINPUT_MAX_WAITING_EVENTS) {
+        WDFOBJECT old = WdfCollectionGetFirstItem(fc->WaitingEvents);
+        auto* ooc = VoidInputOpGetContext(old);
+        if (ooc->VhfOp) { VhfAsyncOperationComplete(ooc->VhfOp, STATUS_CANCELLED); }
+        WdfCollectionRemove(fc->WaitingEvents, old);
+        WdfObjectDelete(old);
+    }
+    WdfWaitLockRelease(fc->EventLock);
+
+    // Service a pending GET_EVENT for this file, if one is waiting.
+    WDFREQUEST request = nullptr;
+    if (WdfIoQueueRetrieveRequestByFileObject(fc->DeviceContext->GetEventQueue,
+                                              fc->FileObject, &request) == STATUS_SUCCESS) {
+        if (!VoidInputTryCompleteGetEvent(fc, request)) {
+            if (!NT_SUCCESS(WdfRequestRequeue(request))) {
+                WdfRequestComplete(request, STATUS_CANCELLED);
+            }
+        }
+    }
+}
+
+_Function_class_(EVT_VHF_ASYNC_OPERATION)
+static VOID VoidInputEvtVhfWriteReport(PVOID VhfClientContext, VHFOPERATIONHANDLE VhfOperationHandle,
+                                       PVOID VhfOperationContext, PHID_XFER_PACKET HidTransferPacket)
+{
+    UNREFERENCED_PARAMETER(VhfOperationContext);
+    VoidInputDispatchEvent((PVOIDINPUT_FILE_CONTEXT)VhfClientContext, VhfOperationHandle,
+                           HidTransferPacket, VoidInputEventWriteReport);
+}
+
+// Dequeue a handed-out op by request id; the caller completes it.
+static WDFOBJECT VoidInputTakeOutstandingById(PVOIDINPUT_FILE_CONTEXT fc, ULONG requestId)
+{
+    WdfWaitLockAcquire(fc->EventLock, NULL);
+    ULONG count = WdfCollectionGetCount(fc->OutstandingEvents);
+    for (ULONG i = 0; i < count; ++i) {
+        WDFOBJECT op = WdfCollectionGetItem(fc->OutstandingEvents, i);
+        if (VoidInputOpGetContext(op)->RequestId == requestId) {
+            WdfCollectionRemoveItem(fc->OutstandingEvents, i);
+            WdfWaitLockRelease(fc->EventLock);
+            return op;
+        }
+    }
+    WdfWaitLockRelease(fc->EventLock);
+    return nullptr;
+}
+
+// Cancel and free all queued/outstanding events (device teardown).
+static VOID VoidInputRundownEvents(PVOIDINPUT_FILE_CONTEXT fc)
+{
+    WdfWaitLockAcquire(fc->EventLock, NULL);
+    WDFOBJECT op;
+    while ((op = WdfCollectionGetFirstItem(fc->WaitingEvents)) != nullptr) {
+        auto* oc = VoidInputOpGetContext(op);
+        if (oc->VhfOp) { VhfAsyncOperationComplete(oc->VhfOp, STATUS_CANCELLED); }
+        WdfCollectionRemove(fc->WaitingEvents, op);
+        WdfObjectDelete(op);
+    }
+    while ((op = WdfCollectionGetFirstItem(fc->OutstandingEvents)) != nullptr) {
+        auto* oc = VoidInputOpGetContext(op);
+        if (oc->VhfOp) { VhfAsyncOperationComplete(oc->VhfOp, STATUS_CANCELLED); }
+        WdfCollectionRemove(fc->OutstandingEvents, op);
+        WdfObjectDelete(op);
+    }
+    WdfWaitLockRelease(fc->EventLock);
+}
+
+// ---------------------------------------------------------------------------
 // Device create / destroy
 //
 // Create reserves a live slot under the lock (enforcing the capacity rules),
@@ -88,8 +253,12 @@ static NTSTATUS VoidInputDoCreate(PVOIDINPUT_DEVICE_CONTEXT dc,
     container.Data4[7] = (UCHAR)(container.Data4[7] + (UCHAR)slot);
     fc->VhfConfig.ContainerID = container;
 
-    // Output/feature event callbacks are wired when the first type that emits
-    // output reports (the Xbox pad) lands; the mouse is input-only.
+    // Register the VHF output/feature callbacks this type opts into. Mouse and
+    // keyboard are input-only (none); the Xbox pad registers write-report for
+    // rumble. (DS4/DS5 add the feature-report callbacks later.)
+    if (desc->Events & VOIDINPUT_EVT_WRITE_REPORT) {
+        fc->VhfConfig.EvtVhfAsyncOperationWriteReport = VoidInputEvtVhfWriteReport;
+    }
 
     NTSTATUS status = VhfCreate(&fc->VhfConfig, &fc->VhfHandle);
     if (!NT_SUCCESS(status)) {
@@ -131,8 +300,14 @@ static void VoidInputDoDestroy(PVOIDINPUT_DEVICE_CONTEXT dc, PVOIDINPUT_FILE_CON
     if (!fc->VhfHandle) {
         return;   // idempotent: no device is a no-op
     }
-    VhfDelete(fc->VhfHandle, TRUE);
+    // Stop new events from queuing, cancel any in flight, then delete the device.
+    VHFHANDLE vhf = fc->VhfHandle;
+    WdfWaitLockAcquire(fc->EventLock, NULL);
     fc->VhfHandle = nullptr;
+    WdfWaitLockRelease(fc->EventLock);
+    VoidInputRundownEvents(fc);
+
+    VhfDelete(vhf, TRUE);
 
     if (fc->LiveIndex >= 0) {
         WdfWaitLockAcquire(dc->Lock, NULL);
@@ -221,6 +396,17 @@ NTSTATUS VoidInputDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
         return status;
     }
 
+    // Manual queue holding pended GET_EVENT requests until an output/feature
+    // event arrives for that file.
+    WDF_IO_QUEUE_CONFIG eventQueueConfig;
+    WDF_IO_QUEUE_CONFIG_INIT(&eventQueueConfig, WdfIoQueueDispatchManual);
+    eventQueueConfig.PowerManaged = WdfFalse;
+    status = WdfIoQueueCreate(device, &eventQueueConfig, WDF_NO_OBJECT_ATTRIBUTES, &dc->GetEventQueue);
+    if (!NT_SUCCESS(status)) {
+        VOID_LOG("WdfIoQueueCreate (events) failed 0x%08X", status);
+        return status;
+    }
+
     status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_VOIDINPUT, nullptr);
     if (!NT_SUCCESS(status)) {
         VOID_LOG("WdfDeviceCreateDeviceInterface failed 0x%08X", status);
@@ -240,15 +426,26 @@ VOID VoidInputFileCreate(WDFDEVICE Device, WDFREQUEST Request, WDFFILEOBJECT Fil
 {
     auto* fc = VoidInputFileGetContext(FileObject);
     RtlZeroMemory(fc, sizeof(*fc));
-    fc->FileObject = FileObject;
-    fc->Type       = VoidInputDeviceNone;
-    fc->LiveIndex  = -1;
+    fc->FileObject    = FileObject;
+    fc->Type          = VoidInputDeviceNone;
+    fc->LiveIndex     = -1;
+    fc->DeviceContext = VoidInputDeviceGetContext(Device);
 
     WDF_OBJECT_ATTRIBUTES attr;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ParentObject = FileObject;
 
-    NTSTATUS status = WdfIoTargetCreate(Device, &attr, &fc->VhfIoTarget);
+    // Per-handle output/feature event channel.
+    NTSTATUS status = WdfWaitLockCreate(&attr, &fc->EventLock);
+    if (NT_SUCCESS(status)) { status = WdfCollectionCreate(&attr, &fc->WaitingEvents); }
+    if (NT_SUCCESS(status)) { status = WdfCollectionCreate(&attr, &fc->OutstandingEvents); }
+    if (!NT_SUCCESS(status)) {
+        VOID_LOG("event-channel setup failed 0x%08X", status);
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    status = WdfIoTargetCreate(Device, &attr, &fc->VhfIoTarget);
     if (!NT_SUCCESS(status)) {
         VOID_LOG("WdfIoTargetCreate failed 0x%08X", status);
         fc->VhfIoTarget = nullptr;
@@ -346,12 +543,47 @@ VOID VoidInputIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
         status = STATUS_SUCCESS;   // idempotent
         break;
     }
-    case IOCTL_VOIDINPUT_GET_EVENT:
-    case IOCTL_VOIDINPUT_COMPLETE_EVENT:
-        // The output/feature event channel lands with the first device type that
-        // emits output reports (rumble/LED/lightbar).
-        status = STATUS_NOT_SUPPORTED;
+    case IOCTL_VOIDINPUT_GET_EVENT: {
+        if (!fc->VhfHandle) {
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
+        if (VoidInputTryCompleteGetEvent(fc, Request)) {
+            return;   // completed inside (with an event or an error)
+        }
+        // Nothing waiting; pend it until an event arrives for this file.
+        status = WdfRequestForwardToIoQueue(Request, dc->GetEventQueue);
+        if (NT_SUCCESS(status)) {
+            return;   // pended
+        }
+        break;        // forward failed -> complete with the error below
+    }
+    case IOCTL_VOIDINPUT_COMPLETE_EVENT: {
+        VOIDINPUT_EVENT_COMPLETE* in = nullptr;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID*)&in, nullptr);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        WDFOBJECT op = VoidInputTakeOutstandingById(fc, in->RequestId);
+        if (!op) {
+            status = STATUS_NOT_FOUND;
+            break;
+        }
+        auto* oc = VoidInputOpGetContext(op);
+        // For a feature read the host returns data; copy it into the VHF packet
+        // before completing. (Feature reports arrive with DS4/DS5.)
+        if (oc->Type == VoidInputEventGetFeature && oc->Packet.reportBuffer && in->Status == 0) {
+            ULONG n = in->DataLength;
+            if (n > oc->Packet.reportBufferLen) { n = oc->Packet.reportBufferLen; }
+            if (n) { RtlCopyMemory(oc->Packet.reportBuffer, in->Data, n); }
+        }
+        if (oc->VhfOp) {
+            VhfAsyncOperationComplete(oc->VhfOp, (in->Status == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL);
+        }
+        WdfObjectDelete(op);
+        status = STATUS_SUCCESS;
         break;
+    }
     default:
         break;
     }
