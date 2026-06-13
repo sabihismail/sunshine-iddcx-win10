@@ -461,13 +461,24 @@ bool VoidrvDisplayListModes(VoidrvDisplayHandle handle, VoidrvModeList* list)
 
 // ===================== VoidInput =====================================
 
-// Mouse report ids - match the VoidInput mouse HID descriptor (void-input/Devices.cpp).
+// Report ids - match the VoidInput HID descriptors (void-input/Devices.cpp).
 #define VOIDRV_MOUSE_RID_RELATIVE 1
 #define VOIDRV_MOUSE_RID_ABSOLUTE 2
+#define VOIDRV_KBD_RID_KEYBOARD   1
+#define VOIDRV_KBD_RID_CONSUMER   2
 
 struct VoidrvInput {
     HANDLE          Device;
     VoidrvInputType Type;
+
+    // Stateful-tier mouse state.
+    uint8_t  MouseButtons;          // held VOIDRV_MB_* mask
+    int32_t  BoundsLeft, BoundsTop; // absolute-pixel mapping rect; W<=0 => primary display
+    int32_t  BoundsW, BoundsH;
+
+    // Stateful-tier keyboard state.
+    uint8_t  KbdModifiers;          // held VOIDRV_KMOD_* mask
+    uint8_t  KbdKeys[6];            // held HID key usages (0 = empty)
 };
 
 VoidrvStatus VoidrvInputQueryStatus(void)
@@ -507,7 +518,7 @@ VoidrvInputHandle VoidrvInputCreate(VoidrvInputType type)
         return nullptr;
     }
 
-    auto* d = new (std::nothrow) VoidrvInput();
+    auto* d = new (std::nothrow) VoidrvInput();   // value-init zeroes the state fields
     if (!d) {
         CloseHandle(h);   // also removes the device
         return nullptr;
@@ -528,9 +539,11 @@ void VoidrvInputClose(VoidrvInputHandle handle)
     delete handle;
 }
 
-// Pack and submit one 8-byte mouse report (report-id + buttons + X + Y + wheels).
-// X/Y are little-endian 16-bit; the driver interprets them per the report id
-// (relative = signed delta, absolute = 0..32767).
+// ---- internal report packers ----
+
+// One 8-byte mouse report (report-id + buttons + X + Y + wheels). X/Y are
+// little-endian 16-bit; the driver reads them per the report id (relative =
+// signed delta, absolute = 0..32767).
 static bool MouseSubmit(VoidrvInputHandle handle, uint8_t reportId, uint8_t buttons,
                         uint16_t x, uint16_t y, int8_t wheel, int8_t hwheel)
 {
@@ -552,17 +565,220 @@ static bool MouseSubmit(VoidrvInputHandle handle, uint8_t reportId, uint8_t butt
     return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
 }
 
-bool VoidrvInputMouseMoveRelative(VoidrvInputHandle handle, int16_t dx, int16_t dy,
-                                  uint8_t buttons, int8_t wheel, int8_t hwheel)
+// One 9-byte boot-keyboard report from the handle's held modifier + key state.
+static bool KeyboardSubmit(VoidrvInputHandle handle)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_KEYBOARD ||
+        handle->Device == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    uint8_t report[9];
+    report[0] = VOIDRV_KBD_RID_KEYBOARD;
+    report[1] = handle->KbdModifiers;
+    report[2] = 0;   // reserved
+    for (int i = 0; i < 6; ++i) {
+        report[3 + i] = handle->KbdKeys[i];
+    }
+    DWORD written = 0;
+    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+}
+
+static int16_t ClampI16(int32_t v)
+{
+    if (v < -32767) return -32767;
+    if (v >  32767) return  32767;
+    return (int16_t)v;
+}
+
+// Map a desktop pixel coordinate to the absolute 0..32767 range, within the
+// handle's bounds rect or (default) the primary display. Re-queried each call so
+// it tracks Void's own display add/remove/resize.
+static void MapPixels(VoidrvInputHandle handle, int32_t px, int32_t py,
+                      uint16_t* outX, uint16_t* outY)
+{
+    int32_t left = handle->BoundsLeft, top = handle->BoundsTop;
+    int32_t w = handle->BoundsW, h = handle->BoundsH;
+    if (w <= 0 || h <= 0) {
+        left = 0;
+        top  = 0;
+        w = GetSystemMetrics(SM_CXSCREEN);   // primary display
+        h = GetSystemMetrics(SM_CYSCREEN);
+    }
+    if (w < 2) w = 2;
+    if (h < 2) h = 2;
+
+    int32_t rx = px - left;
+    int32_t ry = py - top;
+    if (rx < 0) rx = 0; else if (rx > w - 1) rx = w - 1;
+    if (ry < 0) ry = 0; else if (ry > h - 1) ry = h - 1;
+
+    *outX = (uint16_t)(((int64_t)rx * 32767) / (w - 1));
+    *outY = (uint16_t)(((int64_t)ry * 32767) / (h - 1));
+}
+
+// ---- raw report tier ----
+
+bool VoidrvInputMouseReportRelative(VoidrvInputHandle handle, uint8_t buttons,
+                                    int16_t dx, int16_t dy, int8_t wheel, int8_t hwheel)
 {
     return MouseSubmit(handle, VOIDRV_MOUSE_RID_RELATIVE, buttons,
                        (uint16_t)dx, (uint16_t)dy, wheel, hwheel);
 }
 
-bool VoidrvInputMouseMoveAbsolute(VoidrvInputHandle handle, uint16_t x, uint16_t y,
-                                  uint8_t buttons, int8_t wheel, int8_t hwheel)
+bool VoidrvInputMouseReportAbsolute(VoidrvInputHandle handle, uint8_t buttons,
+                                    uint16_t x, uint16_t y, int8_t wheel, int8_t hwheel)
 {
     return MouseSubmit(handle, VOIDRV_MOUSE_RID_ABSOLUTE, buttons, x, y, wheel, hwheel);
+}
+
+bool VoidrvInputKeyboardReport(VoidrvInputHandle handle, uint8_t modifiers,
+                               const uint8_t keys[6])
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_KEYBOARD ||
+        handle->Device == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    uint8_t report[9];
+    report[0] = VOIDRV_KBD_RID_KEYBOARD;
+    report[1] = modifiers;
+    report[2] = 0;
+    for (int i = 0; i < 6; ++i) {
+        report[3 + i] = keys ? keys[i] : 0;
+    }
+    DWORD written = 0;
+    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+}
+
+bool VoidrvInputConsumerReport(VoidrvInputHandle handle, uint16_t usage)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_KEYBOARD ||
+        handle->Device == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    uint8_t report[3];
+    report[0] = VOIDRV_KBD_RID_CONSUMER;
+    report[1] = (uint8_t)(usage & 0xFF);
+    report[2] = (uint8_t)(usage >> 8);
+    DWORD written = 0;
+    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+}
+
+// ---- stateful event tier ----
+
+bool VoidrvInputMouseMove(VoidrvInputHandle handle, bool relative, int32_t x, int32_t y)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_MOUSE) {
+        return false;
+    }
+    if (relative) {
+        return MouseSubmit(handle, VOIDRV_MOUSE_RID_RELATIVE, handle->MouseButtons,
+                           (uint16_t)ClampI16(x), (uint16_t)ClampI16(y), 0, 0);
+    }
+    uint16_t ax = (uint16_t)(x < 0 ? 0 : (x > 32767 ? 32767 : x));
+    uint16_t ay = (uint16_t)(y < 0 ? 0 : (y > 32767 ? 32767 : y));
+    return MouseSubmit(handle, VOIDRV_MOUSE_RID_ABSOLUTE, handle->MouseButtons, ax, ay, 0, 0);
+}
+
+bool VoidrvInputMouseMoveAbsolutePixels(VoidrvInputHandle handle, int32_t px, int32_t py)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_MOUSE) {
+        return false;
+    }
+    uint16_t ax = 0, ay = 0;
+    MapPixels(handle, px, py, &ax, &ay);
+    return MouseSubmit(handle, VOIDRV_MOUSE_RID_ABSOLUTE, handle->MouseButtons, ax, ay, 0, 0);
+}
+
+bool VoidrvInputMouseSetBounds(VoidrvInputHandle handle, int32_t left, int32_t top,
+                               int32_t width, int32_t height)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_MOUSE) {
+        return false;
+    }
+    handle->BoundsLeft = left;
+    handle->BoundsTop  = top;
+    handle->BoundsW    = width;
+    handle->BoundsH    = height;
+    return true;
+}
+
+bool VoidrvInputMouseButton(VoidrvInputHandle handle, uint8_t button, bool down)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_MOUSE) {
+        return false;
+    }
+    if (down) {
+        handle->MouseButtons |= button;
+    } else {
+        handle->MouseButtons = (uint8_t)(handle->MouseButtons & ~button);
+    }
+    // Carry the button change on a relative report with no motion, so the cursor
+    // does not jump regardless of how it was last positioned.
+    return MouseSubmit(handle, VOIDRV_MOUSE_RID_RELATIVE, handle->MouseButtons, 0, 0, 0, 0);
+}
+
+bool VoidrvInputMouseWheel(VoidrvInputHandle handle, int8_t dv, int8_t dh)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_MOUSE) {
+        return false;
+    }
+    return MouseSubmit(handle, VOIDRV_MOUSE_RID_RELATIVE, handle->MouseButtons, 0, 0, dv, dh);
+}
+
+bool VoidrvInputKey(VoidrvInputHandle handle, uint16_t hidUsage, bool down)
+{
+    if (!handle || handle->Type != VOIDRV_INPUT_KEYBOARD) {
+        return false;
+    }
+    if (hidUsage >= 0xE0 && hidUsage <= 0xE7) {
+        uint8_t bit = (uint8_t)(1u << (hidUsage - 0xE0));
+        if (down) {
+            handle->KbdModifiers |= bit;
+        } else {
+            handle->KbdModifiers = (uint8_t)(handle->KbdModifiers & ~bit);
+        }
+    } else if (hidUsage != 0 && hidUsage <= 0xFF) {
+        uint8_t u = (uint8_t)hidUsage;
+        int found = -1, empty = -1;
+        for (int i = 0; i < 6; ++i) {
+            if (handle->KbdKeys[i] == u) { found = i; break; }
+            if (handle->KbdKeys[i] == 0 && empty < 0) { empty = i; }
+        }
+        if (down) {
+            if (found < 0 && empty >= 0) {
+                handle->KbdKeys[empty] = u;   // rollover full -> drop the extra key
+            }
+        } else if (found >= 0) {
+            handle->KbdKeys[found] = 0;
+        }
+    } else {
+        return false;   // outside the boot-keyboard usage range
+    }
+    return KeyboardSubmit(handle);
+}
+
+bool VoidrvInputConsumer(VoidrvInputHandle handle, uint16_t usage)
+{
+    return VoidrvInputConsumerReport(handle, usage);
+}
+
+bool VoidrvInputReset(VoidrvInputHandle handle)
+{
+    if (!handle) {
+        return false;
+    }
+    if (handle->Type == VOIDRV_INPUT_MOUSE) {
+        handle->MouseButtons = 0;
+        return MouseSubmit(handle, VOIDRV_MOUSE_RID_RELATIVE, 0, 0, 0, 0, 0);
+    }
+    if (handle->Type == VOIDRV_INPUT_KEYBOARD) {
+        handle->KbdModifiers = 0;
+        for (int i = 0; i < 6; ++i) {
+            handle->KbdKeys[i] = 0;
+        }
+        return KeyboardSubmit(handle);
+    }
+    return false;
 }
 
 } // extern "C"

@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <string>
 
 static void PrintLastError(const char* what)
 {
@@ -45,7 +46,10 @@ static int Usage()
         "  voidctl mouse status\n"
         "  voidctl mouse version\n"
         "  voidctl mouse move <dx> <dy>      (one relative move)\n"
-        "  voidctl mouse demo [seconds]      (trace a circle; default 5s)\n");
+        "  voidctl mouse demo [seconds]      (trace a circle; default 5s)\n"
+        "\n"
+        "  voidctl kbd type <text...>        (type text into the focused window)\n"
+        "  voidctl kbd tap <hidUsage>        (tap one HID usage, hex e.g. 0x04 = 'a')\n");
     return 1;
 }
 
@@ -273,7 +277,7 @@ static int CmdMouseMove(int argc, char** argv)
         std::printf("error: cannot create mouse (is VoidInput installed?)\n");
         return 1;
     }
-    bool ok = VoidrvInputMouseMoveRelative(h, (int16_t)dx, (int16_t)dy, 0, 0, 0);
+    bool ok = VoidrvInputMouseMove(h, true, dx, dy);
     Sleep(50);   // let the report deliver before the device unplugs on close
     VoidrvInputClose(h);
     std::printf(ok ? "moved by (%d, %d)\n" : "error: move failed\n", dx, dy);
@@ -298,13 +302,110 @@ static int CmdMouseDemo(int argc, char** argv)
     const int ticks = seconds * hz;
     for (int i = 0; i < ticks; ++i) {
         double th = (double)i / hz * 3.14159265358979;   // ~0.5 revolution/sec
-        uint16_t x = (uint16_t)(16384.0 + 6000.0 * std::cos(th));
-        uint16_t y = (uint16_t)(16384.0 + 6000.0 * std::sin(th));
-        VoidrvInputMouseMoveAbsolute(h, x, y, 0, 0, 0);
+        int32_t x = (int32_t)(16384.0 + 6000.0 * std::cos(th));
+        int32_t y = (int32_t)(16384.0 + 6000.0 * std::sin(th));
+        VoidrvInputMouseMove(h, false, x, y);
         Sleep(1000 / hz);
     }
     VoidrvInputClose(h);
     std::printf("done\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// keyboard
+// ---------------------------------------------------------------------------
+
+// Minimal ASCII -> HID Keyboard/Keypad usage (+ shift). Enough for a smoke test;
+// not a full layout. Returns false for unmapped characters.
+static bool AsciiToHid(char c, uint8_t* usage, bool* shift)
+{
+    *shift = false;
+    if (c >= 'a' && c <= 'z') { *usage = (uint8_t)(0x04 + (c - 'a')); return true; }
+    if (c >= 'A' && c <= 'Z') { *usage = (uint8_t)(0x04 + (c - 'A')); *shift = true; return true; }
+    if (c >= '1' && c <= '9') { *usage = (uint8_t)(0x1E + (c - '1')); return true; }
+    switch (c) {
+        case '0':  *usage = 0x27; return true;
+        case ' ':  *usage = 0x2C; return true;
+        case '\n': *usage = 0x28; return true;
+        case '\t': *usage = 0x2B; return true;
+        case '-':  *usage = 0x2D; return true;
+        case '=':  *usage = 0x2E; return true;
+        case '.':  *usage = 0x37; return true;
+        case ',':  *usage = 0x36; return true;
+        case '/':  *usage = 0x38; return true;
+        case ';':  *usage = 0x33; return true;
+        case '\'': *usage = 0x34; return true;
+        case '!':  *usage = 0x1E; *shift = true; return true;
+        case '@':  *usage = 0x1F; *shift = true; return true;
+        case '#':  *usage = 0x20; *shift = true; return true;
+        case '$':  *usage = 0x21; *shift = true; return true;
+        case '%':  *usage = 0x22; *shift = true; return true;
+        case '?':  *usage = 0x38; *shift = true; return true;
+        case ':':  *usage = 0x33; *shift = true; return true;
+        case '_':  *usage = 0x2D; *shift = true; return true;
+        case '+':  *usage = 0x2E; *shift = true; return true;
+    }
+    return false;
+}
+
+static int CmdKbdType(int argc, char** argv)
+{
+    if (argc < 1) {
+        std::printf("error: kbd type needs <text>\n");
+        return 1;
+    }
+    std::string text;
+    for (int i = 0; i < argc; ++i) {
+        if (i) text += ' ';
+        text += argv[i];
+    }
+
+    VoidrvInputHandle h = VoidrvInputCreate(VOIDRV_INPUT_KEYBOARD);
+    if (!h) {
+        std::printf("error: cannot create keyboard (is VoidInput installed?)\n");
+        return 1;
+    }
+
+    for (char c : text) {
+        uint8_t usage = 0;
+        bool    shift = false;
+        if (!AsciiToHid(c, &usage, &shift)) {
+            continue;
+        }
+        if (shift) VoidrvInputKey(h, 0xE1, true);    // Left Shift
+        VoidrvInputKey(h, usage, true);
+        Sleep(8);
+        VoidrvInputKey(h, usage, false);
+        if (shift) VoidrvInputKey(h, 0xE1, false);
+        Sleep(8);
+    }
+    VoidrvInputReset(h);
+    Sleep(30);   // let the final reports deliver before the device unplugs on close
+    VoidrvInputClose(h);
+    std::printf("typed %d chars\n", (int)text.size());
+    return 0;
+}
+
+static int CmdKbdTap(int argc, char** argv)
+{
+    if (argc < 1) {
+        std::printf("error: kbd tap needs <hidUsage> (hex, e.g. 0x04 = 'a')\n");
+        return 1;
+    }
+    unsigned usage = (unsigned)std::strtoul(argv[0], nullptr, 16);
+
+    VoidrvInputHandle h = VoidrvInputCreate(VOIDRV_INPUT_KEYBOARD);
+    if (!h) {
+        std::printf("error: cannot create keyboard\n");
+        return 1;
+    }
+    VoidrvInputKey(h, (uint16_t)usage, true);
+    Sleep(20);
+    VoidrvInputKey(h, (uint16_t)usage, false);
+    Sleep(20);
+    VoidrvInputClose(h);
+    std::printf("tapped usage 0x%02X\n", usage);
     return 0;
 }
 
@@ -324,6 +425,14 @@ int main(int argc, char** argv)
         else if (std::strcmp(cmd, "version") == 0) return CmdMouseVersion();
         else if (std::strcmp(cmd, "move")    == 0) return CmdMouseMove(rest_argc, rest_argv);
         else if (std::strcmp(cmd, "demo")    == 0) return CmdMouseDemo(rest_argc, rest_argv);
+        return Usage();
+    }
+
+    if (std::strcmp(group, "kbd") == 0) {
+        if      (std::strcmp(cmd, "status")  == 0) return CmdMouseStatus();   // device-wide
+        else if (std::strcmp(cmd, "version") == 0) return CmdMouseVersion();
+        else if (std::strcmp(cmd, "type")    == 0) return CmdKbdType(rest_argc, rest_argv);
+        else if (std::strcmp(cmd, "tap")     == 0) return CmdKbdTap(rest_argc, rest_argv);
         return Usage();
     }
 

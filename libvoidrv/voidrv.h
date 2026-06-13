@@ -112,6 +112,16 @@ typedef enum VoidrvInputType {
 #define VOIDRV_MB_X1      0x08
 #define VOIDRV_MB_X2      0x10
 
+/* Keyboard modifier bitmask (matches HID usages 0xE0..0xE7). */
+#define VOIDRV_KMOD_LCTRL   0x01
+#define VOIDRV_KMOD_LSHIFT  0x02
+#define VOIDRV_KMOD_LALT    0x04
+#define VOIDRV_KMOD_LGUI    0x08
+#define VOIDRV_KMOD_RCTRL   0x10
+#define VOIDRV_KMOD_RSHIFT  0x20
+#define VOIDRV_KMOD_RALT    0x40
+#define VOIDRV_KMOD_RGUI    0x80
+
 /* Opaque per-device handle. Each handle owns exactly one virtual device; the
    device exists until the handle is closed. */
 typedef struct VoidrvInput* VoidrvInputHandle;
@@ -129,18 +139,59 @@ VoidrvInputHandle VoidrvInputCreate(VoidrvInputType type);
 /* Remove the device and close its handle. */
 void              VoidrvInputClose(VoidrvInputHandle handle);
 
-/* Mouse - relative move. dx/dy are signed deltas; buttons is a VOIDRV_MB_*
-   bitmask; wheel/hwheel are signed detents. Requires a mouse handle. */
-bool              VoidrvInputMouseMoveRelative(VoidrvInputHandle handle,
-                                               int16_t dx, int16_t dy,
-                                               uint8_t buttons,
-                                               int8_t wheel, int8_t hwheel);
+/* ---- Raw report tier: submit one full-state HID report (no held state). ---- */
 
-/* Mouse - absolute position, normalized 0..32767 across the desktop. */
-bool              VoidrvInputMouseMoveAbsolute(VoidrvInputHandle handle,
-                                               uint16_t x, uint16_t y,
-                                               uint8_t buttons,
-                                               int8_t wheel, int8_t hwheel);
+/* Mouse relative report: buttons bitmask + signed deltas + signed wheel detents. */
+bool              VoidrvInputMouseReportRelative(VoidrvInputHandle handle, uint8_t buttons,
+                                                 int16_t dx, int16_t dy,
+                                                 int8_t wheel, int8_t hwheel);
+
+/* Mouse absolute report: buttons + normalized 0..32767 X/Y + signed wheel detents. */
+bool              VoidrvInputMouseReportAbsolute(VoidrvInputHandle handle, uint8_t buttons,
+                                                 uint16_t x, uint16_t y,
+                                                 int8_t wheel, int8_t hwheel);
+
+/* Keyboard report: modifier bitmask (VOIDRV_KMOD_*) + up to 6 HID key usages
+   (0 = empty slot). Bypasses the stateful key tracking below. */
+bool              VoidrvInputKeyboardReport(VoidrvInputHandle handle, uint8_t modifiers,
+                                            const uint8_t keys[6]);
+
+/* Consumer-control report: one 16-bit HID consumer usage (0 = release). */
+bool              VoidrvInputConsumerReport(VoidrvInputHandle handle, uint16_t usage);
+
+/* ---- Stateful event tier: the SDK remembers held buttons / keys and re-emits
+        the full report, so callers can feed a raw input event stream. ---- */
+
+/* Mouse motion. relative: x/y are signed deltas; absolute: x/y are 0..32767.
+   Re-emits with the currently-held buttons. */
+bool              VoidrvInputMouseMove(VoidrvInputHandle handle, bool relative,
+                                       int32_t x, int32_t y);
+
+/* Mouse absolute motion in desktop pixels, mapped to 0..32767. Defaults to the
+   primary display (see VoidrvInputMouseSetBounds). */
+bool              VoidrvInputMouseMoveAbsolutePixels(VoidrvInputHandle handle,
+                                                     int32_t px, int32_t py);
+
+/* Pixel rectangle that VoidrvInputMouseMoveAbsolutePixels maps within.
+   width<=0 restores the default (primary display). */
+bool              VoidrvInputMouseSetBounds(VoidrvInputHandle handle, int32_t left,
+                                            int32_t top, int32_t width, int32_t height);
+
+/* Mouse button press/release (VOIDRV_MB_*); re-emits with held buttons. */
+bool              VoidrvInputMouseButton(VoidrvInputHandle handle, uint8_t button, bool down);
+
+/* Mouse wheel: signed vertical + horizontal detents; re-emits with held buttons. */
+bool              VoidrvInputMouseWheel(VoidrvInputHandle handle, int8_t dv, int8_t dh);
+
+/* Keyboard key press/release by HID usage (incl. modifiers 0xE0..0xE7); the SDK
+   maintains the modifier bitmask + 6-key rollover and re-emits the report. */
+bool              VoidrvInputKey(VoidrvInputHandle handle, uint16_t hidUsage, bool down);
+
+/* Consumer-control key by HID usage (0 to release). */
+bool              VoidrvInputConsumer(VoidrvInputHandle handle, uint16_t usage);
+
+/* Release all held buttons / keys and emit a cleared report. */
+bool              VoidrvInputReset(VoidrvInputHandle handle);
 
 #ifdef __cplusplus
 } /* extern "C" */
