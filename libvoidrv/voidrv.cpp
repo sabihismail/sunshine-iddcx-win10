@@ -32,8 +32,10 @@ struct VoidrvDisplay {
     HANDLE Device;
 };
 
-// Enumerate the device interface and open the first instance.
-static HANDLE OpenInterface(const GUID* interfaceGuid)
+// Enumerate the device interface and open the first instance. VoidInput opens
+// overlapped (overlapped=true) so its background event reader and input writes do
+// not serialize on the one file handle; VoidDisplay opens synchronous.
+static HANDLE OpenInterface(const GUID* interfaceGuid, bool overlapped = false)
 {
     HANDLE handle = INVALID_HANDLE_VALUE;
 
@@ -64,7 +66,9 @@ static HANDLE OpenInterface(const GUID* interfaceGuid)
             handle = CreateFileW(detail->DevicePath,
                                  GENERIC_READ | GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                 nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | (overlapped ? FILE_FLAG_OVERLAPPED : 0),
+                                 nullptr);
         }
         free(detail);
 
@@ -85,6 +89,44 @@ static bool Control(HANDLE device, DWORD code,
     if (bytes) {
         *bytes = br;
     }
+    return ok != FALSE;
+}
+
+// Overlapped-handle variants for VoidInput (its handle is opened FILE_FLAG_OVERLAPPED).
+// Issue the I/O and wait for completion, so the device handle is never serialized.
+static bool InputControl(HANDLE device, DWORD code,
+                         void* in, DWORD inLen, void* out, DWORD outLen, DWORD* bytes)
+{
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) {
+        return false;
+    }
+    DWORD br = 0;
+    BOOL ok = DeviceIoControl(device, code, in, inLen, out, outLen, &br, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(device, &ov, &br, TRUE);
+    }
+    CloseHandle(ov.hEvent);
+    if (bytes) {
+        *bytes = br;
+    }
+    return ok != FALSE;
+}
+
+static bool InputWrite(HANDLE device, const void* buffer, DWORD length)
+{
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) {
+        return false;
+    }
+    DWORD bw = 0;
+    BOOL ok = WriteFile(device, buffer, length, &bw, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(device, &ov, &bw, TRUE);
+    }
+    CloseHandle(ov.hEvent);
     return ok != FALSE;
 }
 
@@ -492,7 +534,7 @@ static DWORD WINAPI VoidrvPadEventReader(LPVOID param);
 
 VoidrvStatus VoidrvInputQueryStatus(void)
 {
-    HANDLE h = OpenInterface(&GUID_DEVINTERFACE_VOIDINPUT);
+    HANDLE h = OpenInterface(&GUID_DEVINTERFACE_VOIDINPUT, true);
     if (h == INVALID_HANDLE_VALUE || h == nullptr) {
         return VOIDRV_STATUS_NOT_INSTALLED;
     }
@@ -502,19 +544,19 @@ VoidrvStatus VoidrvInputQueryStatus(void)
 
 uint32_t VoidrvInputVersion(void)
 {
-    HANDLE h = OpenInterface(&GUID_DEVINTERFACE_VOIDINPUT);
+    HANDLE h = OpenInterface(&GUID_DEVINTERFACE_VOIDINPUT, true);
     if (h == INVALID_HANDLE_VALUE || h == nullptr) {
         return 0;
     }
     ULONG version = 0;
-    bool ok = Control(h, IOCTL_VOIDINPUT_VERSION, nullptr, 0, &version, sizeof(version), nullptr);
+    bool ok = InputControl(h, IOCTL_VOIDINPUT_VERSION, nullptr, 0, &version, sizeof(version), nullptr);
     CloseHandle(h);
     return ok ? version : 0;
 }
 
 VoidrvInputHandle VoidrvInputCreate(VoidrvInputType type)
 {
-    HANDLE h = OpenInterface(&GUID_DEVINTERFACE_VOIDINPUT);
+    HANDLE h = OpenInterface(&GUID_DEVINTERFACE_VOIDINPUT, true);
     if (h == INVALID_HANDLE_VALUE || h == nullptr) {
         return nullptr;
     }
@@ -522,7 +564,7 @@ VoidrvInputHandle VoidrvInputCreate(VoidrvInputType type)
     VOIDINPUT_CREATE req;
     ZeroMemory(&req, sizeof(req));
     req.Type = (UINT32)type;
-    if (!Control(h, IOCTL_VOIDINPUT_CREATE, &req, sizeof(req), nullptr, 0, nullptr)) {
+    if (!InputControl(h, IOCTL_VOIDINPUT_CREATE, &req, sizeof(req), nullptr, 0, nullptr)) {
         CloseHandle(h);
         return nullptr;
     }
@@ -557,12 +599,12 @@ void VoidrvInputClose(VoidrvInputHandle handle)
         return;
     }
     if (handle->RumbleThread) {
-        // Closing the device handle cancels the reader's pending GET_EVENT (and
-        // removes the device), so the thread returns; then we join it.
+        // Unblock the reader's pending GET_EVENT with CancelIoEx (CloseHandle alone
+        // does NOT cancel an in-flight synchronous IOCTL on another thread, so the
+        // join would hang). Join first, then close the handle (removes the device).
         InterlockedExchange(&handle->RumbleStop, 1);
         if (handle->Device && handle->Device != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle->Device);
-            handle->Device = INVALID_HANDLE_VALUE;
+            CancelIoEx(handle->Device, nullptr);
         }
         WaitForSingleObject(handle->RumbleThread, INFINITE);
         CloseHandle(handle->RumbleThread);
@@ -596,8 +638,7 @@ static bool MouseSubmit(VoidrvInputHandle handle, uint8_t reportId, uint8_t butt
     report[6] = (uint8_t)wheel;
     report[7] = (uint8_t)hwheel;
 
-    DWORD written = 0;
-    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+    return InputWrite(handle->Device, report, sizeof(report));
 }
 
 // One 9-byte boot-keyboard report from the handle's held modifier + key state.
@@ -614,8 +655,7 @@ static bool KeyboardSubmit(VoidrvInputHandle handle)
     for (int i = 0; i < 6; ++i) {
         report[3 + i] = handle->KbdKeys[i];
     }
-    DWORD written = 0;
-    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+    return InputWrite(handle->Device, report, sizeof(report));
 }
 
 static int16_t ClampI16(int32_t v)
@@ -680,8 +720,7 @@ bool VoidrvInputKeyboardReport(VoidrvInputHandle handle, uint8_t modifiers,
     for (int i = 0; i < 6; ++i) {
         report[3 + i] = keys ? keys[i] : 0;
     }
-    DWORD written = 0;
-    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+    return InputWrite(handle->Device, report, sizeof(report));
 }
 
 bool VoidrvInputConsumerReport(VoidrvInputHandle handle, uint16_t usage)
@@ -694,8 +733,7 @@ bool VoidrvInputConsumerReport(VoidrvInputHandle handle, uint16_t usage)
     report[0] = VOIDRV_KBD_RID_CONSUMER;
     report[1] = (uint8_t)(usage & 0xFF);
     report[2] = (uint8_t)(usage >> 8);
-    DWORD written = 0;
-    return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+    return InputWrite(handle->Device, report, sizeof(report));
 }
 
 // ---- stateful event tier ----
@@ -970,16 +1008,15 @@ bool VoidrvInputPadReport(VoidrvInputHandle handle, const VoidrvPadState* state)
     if (!handle || !state || handle->Device == INVALID_HANDLE_VALUE) {
         return false;
     }
-    DWORD written = 0;
     if (handle->Type == VOIDRV_INPUT_XBOXONE) {
         uint8_t report[17];
         PackXboxPad(state, report);
-        return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+        return InputWrite(handle->Device, report, sizeof(report));
     }
     if (handle->Type == VOIDRV_INPUT_DS4) {
         uint8_t report[64];
         PackDs4Pad(state, report);
-        return WriteFile(handle->Device, report, sizeof(report), &written, nullptr) != FALSE;
+        return InputWrite(handle->Device, report, sizeof(report));
     }
     return false;
 }
@@ -992,15 +1029,25 @@ bool VoidrvInputPadReport(VoidrvInputHandle handle, const VoidrvPadState* state)
 static DWORD WINAPI VoidrvPadEventReader(LPVOID param)
 {
     auto* h = (VoidrvInputHandle)param;
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) {
+        return 0;
+    }
     for (;;) {
         if (InterlockedCompareExchange(&h->RumbleStop, 0, 0) != 0) {
             break;
         }
         VOIDINPUT_EVENT ev;
         DWORD br = 0;
-        if (!DeviceIoControl(h->Device, IOCTL_VOIDINPUT_GET_EVENT, nullptr, 0,
-                             &ev, sizeof(ev), &br, nullptr)) {
-            break;   // handle closed / request cancelled
+        ResetEvent(ov.hEvent);
+        BOOL ok = DeviceIoControl(h->Device, IOCTL_VOIDINPUT_GET_EVENT, nullptr, 0,
+                                  &ev, sizeof(ev), &br, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            ok = GetOverlappedResult(h->Device, &ov, &br, TRUE);
+        }
+        if (!ok) {
+            break;   // cancelled on close (CancelIoEx) or error
         }
 
         VOIDINPUT_EVENT_COMPLETE done;
@@ -1031,9 +1078,10 @@ static DWORD WINAPI VoidrvPadEventReader(LPVOID param)
         }
         // SetFeature (and unhandled GetFeature) just succeed with no data.
 
-        DeviceIoControl(h->Device, IOCTL_VOIDINPUT_COMPLETE_EVENT, &done, sizeof(done),
-                        nullptr, 0, &br, nullptr);
+        InputControl(h->Device, IOCTL_VOIDINPUT_COMPLETE_EVENT, &done, sizeof(done),
+                     nullptr, 0, nullptr);
     }
+    CloseHandle(ov.hEvent);
     return 0;
 }
 

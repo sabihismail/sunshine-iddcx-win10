@@ -648,6 +648,8 @@ VOID VoidInputIoWrite(WDFQUEUE Queue, WDFREQUEST Request, size_t Length)
 
     status = VhfReadReportSubmit(fc->VhfHandle, &packet);
     if (!NT_SUCCESS(status)) {
+        VOID_LOG("VhfReadReportSubmit failed 0x%08X (type=%d reportId=%u len=%Iu)",
+                 status, (int)fc->Type, packet.reportId, Length);
         WdfRequestComplete(Request, status);
         return;
     }
