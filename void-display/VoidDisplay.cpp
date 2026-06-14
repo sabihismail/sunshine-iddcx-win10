@@ -451,7 +451,7 @@ void VoidDisplayDevice::InitAdapter()
     caps.EndPointDiagnostics.TransmissionType          = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
     caps.EndPointDiagnostics.pEndPointFriendlyName     = L"Void Virtual Display";
     caps.EndPointDiagnostics.pEndPointManufacturerName = L"Void Virtual Driver";
-    caps.EndPointDiagnostics.pEndPointModelName        = L"VoidDisplay";
+    caps.EndPointDiagnostics.pEndPointModelName        = L"VoidVDA";
     caps.EndPointDiagnostics.pFirmwareVersion          = &firmware;
     caps.EndPointDiagnostics.pHardwareVersion          = &hardware;
 

@@ -7,7 +7,7 @@
 //   bytes 12-15 : serial number (patched per monitor by VoidBuildEdid)
 //   byte     17 : year = 2026 - 1990 = 36 (0x24)
 //   bytes 54-71 : preferred detailed timing = 1920x1080 @ 60
-//   bytes 72-89 : monitor name descriptor "VoidDisplay"
+//   bytes 72-89 : monitor name descriptor "VoidVDA"
 //   byte    127 : checksum (recomputed by VoidBuildEdid)
 //
 // The full advertised mode list is provided through the IddCx mode callbacks,
@@ -31,9 +31,9 @@ static const UINT8 s_VoidEdidTemplate[VOIDDISPLAY_EDID_SIZE] = {
     // detailed timing descriptor 1: 1920x1080 @ 60 (preferred)
     0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C,
     0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
-    // descriptor 2: monitor name "VoidDisplay"
+    // descriptor 2: monitor name "VoidVDA" (7 chars + 0x0A terminator + 0x20 padding)
     0x00, 0x00, 0x00, 0xFC, 0x00,
-    'V', 'o', 'i', 'd', 'D', 'i', 's', 'p', 'l', 'a', 'y', 0x0A, 0x20,
+    'V', 'o', 'i', 'd', 'V', 'D', 'A', 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20,
     // descriptor 3: monitor range limits (24-240 Hz, 15-160 kHz, 600 MHz)
     0x00, 0x00, 0x00, 0xFD, 0x00,
     0x18, 0xF0, 0x0F, 0xA0, 0x3C, 0x00, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,

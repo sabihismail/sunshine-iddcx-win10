@@ -196,7 +196,8 @@ Each monitor reports a synthesized EDID 1.4 block:
 
 - Manufacturer id `VVD`. EDID packs three 5-bit letters (A=1..Z=26) big-endian with
   the high bit clear: `V=22, V=22, D=4` -> bytes `0x5A 0xC4` at EDID offsets 8-9.
-- Monitor product name `VoidDisplay` in a type 0xFC descriptor.
+- Monitor product name `VoidVDA` in a type 0xFC descriptor (the name shown in
+  Windows Display Settings; the adapter stays `Void Virtual Display Adapter`).
 - Preferred detailed timing matches the display's current mode (default
   1920x1080 @ 60).
 - Standard timings advertise the common modes from section 4; the full mode list is
