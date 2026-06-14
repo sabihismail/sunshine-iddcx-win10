@@ -16,17 +16,21 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2025
+    # windows-2022 = VS 2022 (v17), which matches WDK 26100's .17.0 driver build
+    # tasks. windows-2025 was migrated to VS 2026 (v18) and needs WDK 28000's .18.0
+    # tasks (MSB4062 'Microsoft.DriverKit.Build.Tasks.18.0.dll' not found) - a
+    # mismatch with our 10.0.26100 target.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      # windows-2025 has VS2022 + Win11 SDK 10.0.26100 + the WDK VS extension, but not
-      # the WDK *content* (wdf\umdf headers like wudfwdm.h / wdf.h). The choco package
-      # installs the wrong build (22000); install the official WDK 26100 that matches
-      # the runner's SDK 26100.
+      # The runner has VS2022 + Win11 SDK 10.0.26100 but not the WDK *content* (wdf\umdf
+      # headers like wudfwdm.h / wdf.h). The choco package installs the wrong build
+      # (22000); install the official WDK 26100 (matches VS2022's .17.0 build tasks and
+      # the SDK 26100).
       - name: Install WDK 10.0.26100
         shell: pwsh
         run: |
