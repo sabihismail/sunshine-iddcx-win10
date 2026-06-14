@@ -142,12 +142,10 @@ Semantics:
 - The advertised list is a process-global store (the `ParseMonitorDescription`
   callback has no per-monitor context), so custom modes apply to every VoidDisplay
   monitor. Custom modes are durable: the SDK mirrors each `ADD_MODE`/`REMOVE_MODE`
-  into a `CustomModes` value (REG_BINARY array of packed `{Width, Height, RefreshHz}`
-  triples) under the driver's WUDF service `Parameters` key, and the driver re-reads
-  it at adapter init, so they survive a device restart or reboot. The IOCTL changes
-  the live list; the registry write (which needs elevation) is best-effort and does
-  not affect the live change. Built-in defaults are always advertised and are never
-  written to the registry.
+  into `[modes]Custom` (comma-separated `WxH@Hz`) in `display.ini` (section 6), which
+  the driver re-reads at adapter init, so they survive a device restart or reboot. The
+  IOCTL changes the live list; the file write is best-effort. Built-in defaults are
+  always advertised and are never written to the file.
 - No `UPDATE`/ping code exists, by design.
 
 ## 4. Default mode set
@@ -207,31 +205,45 @@ Each monitor reports a synthesized EDID 1.4 block:
 The concrete 128-byte block is generated at build time from these fields; see the
 planned `edid.md`. HDR/extension blocks are out of scope for v1.
 
-## 6. Persistence
+A dumped real-monitor EDID can be supplied as `C:\ProgramData\.voidrv\display.edid`
+(128 or 256 bytes) with `[edid]UseCustomEdid = 1`; the driver validates it (header +
+per-block checksum) and uses it in place of the built-in block, falling back if it is
+absent or invalid. With `[edid]PatchSerial = 1` it stamps a per-slot serial (recomputing
+the base-block checksum) so multiple monitors are not byte-identical; `0` clones the file
+verbatim (best for a single display). The SDK locates VoidDisplay GDI devices by the
+ADAPTER name (`Void Virtual Display Adapter`), not the EDID id, so a custom EDID's
+vendor/identity does not break `Add`/`SetMode`.
 
-Display state is persistent so a configured host survives a device restart or
-reboot:
+## 6. Configuration and persistence
 
-- Stored under the driver's WUDF service `Parameters` key as a `PersistedDisplays`
-  value (REG_BINARY array of packed `{Index, Width, Height, RefreshHz}` UINT32
-  entries, one per active slot), alongside a `RestoreOnStart` REG_DWORD (absent or
-  non-zero means restore; `0` disables it).
-- **The SDK writes it.** A UMDF host process has no registry write rights (both the
-  device hardware key and the service `Parameters` key return access-denied), so the
-  driver cannot self-persist. `libvoidrv` instead mirrors each `Add`/`Remove`/
-  `SetMode` into `PersistedDisplays` (best-effort, needs elevation) - the same
-  split used for custom modes (section 3). Because the write is best-effort, an
-  unelevated caller's change is live but not saved; the SDK exposes
-  `VoidrvDisplayPersistenceWritable()` to detect this and `voidctl` warns when a
-  persisting command runs unelevated.
-- On adapter init-finished, after the custom modes are loaded and before any control
-  IOCTL is served, the driver reads `PersistedDisplays` (if `RestoreOnStart`) and
-  recreates each display at its stored slot and mode. Monitor identities are stable
-  per slot (ContainerId + EDID serial), so Windows also restores each display's last
-  resolution and desktop position.
+Operator config and persisted state live in a file, `C:\ProgramData\.voidrv\display.ini`,
+not the registry. A UMDF host process has no registry OR file *write* rights, but it can
+*read* this path. So the split is: the installer creates the folder with `Users:Modify`,
+`libvoidrv` (the SDK) writes the ini, and the driver reads it at init. Because the folder
+ACL grants write, an **unelevated** controller can persist changes with no UAC - the
+reason this replaces the earlier HKLM design (which needed elevation).
 
-The in-memory slot table is the source of truth while the driver runs; the registry
-copy is what a fresh adapter instance restores from.
+`display.ini` keys (seeded with comments by the installer):
+
+| Section / key | Meaning |
+|---|---|
+| `[render] PreferredAdapterVendorId` | composing GPU (section 7); `0`=auto / `0x10DE` / `0x1002` / `0x8086` |
+| `[cursor] HardwareCursor` | hardware-cursor plane (section 8); `1`=overlay, `0`=baked |
+| `[startup] RestoreOnStart` | recreate `[displays]` at init; `1`=on |
+| `[edid] UseCustomEdid` / `PatchSerial` | clone `display.edid` (section 5) |
+| `[modes] Custom` | comma-separated `WxH@Hz` extra modes (section 3) |
+| `[displays]` | `<slot> = WxH@Hz` per active display |
+
+Display persistence: the SDK writes `[displays]` on `Add`/`Remove`/`SetMode`. On adapter
+init-finished, after the custom modes load and before any control IOCTL, the driver
+recreates each persisted display (when `RestoreOnStart`) at its stored slot and mode.
+Identities are stable per slot (ContainerId + EDID serial), so Windows restores each
+display's last resolution and position. `SetModeDynamic` is ephemeral and is not
+persisted. The SDK exposes `VoidrvDisplayPersistenceWritable()` (true when the ini is
+writable); `voidctl` warns only if it is not.
+
+The in-memory slot table is the source of truth while the driver runs; the ini is what a
+fresh adapter instance restores from.
 
 ## 7. Preferred render GPU (parent adapter)
 
@@ -240,10 +252,9 @@ otherwise auto-pick the adapter that composes the virtual desktop. The operator 
 pin it so the desktop is rendered on the GPU that also does capture/encode, avoiding
 a cross-adapter copy.
 
-- Configured via the driver's WUDF service Parameters key:
-  `...\WUDF\Services\VoidDisplay\Parameters\PreferredRenderAdapterVendorId`
-  (REG_DWORD). `0` or absent = auto; `0x10DE` = NVIDIA, `0x1002` = AMD,
-  `0x8086` = Intel. The INF seeds the value at `0` (auto).
+- Configured via `[render]PreferredAdapterVendorId` in display.ini (section 6).
+  `0` or absent = auto; `0x10DE` = NVIDIA, `0x1002` = AMD, `0x8086` = Intel. Change
+  it with `_setrender.ps1` (writes the ini + restarts the device).
 - At adapter init-finished the driver reads the value, enumerates DXGI adapters,
   finds the first non-software adapter from that vendor, and pins it with
   `IddCxAdapterSetRenderAdapter(adapter, { LUID })` - done before any monitor is
@@ -267,8 +278,8 @@ an overlay rather than compositing it into the swap-chain image.
   otherwise show a double pointer - one baked into the stream and one drawn by the
   client. With the hardware-cursor plane the stream carries none, leaving only the
   client's.
-- On by default; `HardwareCursorEnabled=0` (REG_DWORD under the service Parameters
-  key) bakes the pointer into the frames instead (server-side cursor).
+- On by default; `[cursor]HardwareCursor = 0` in display.ini bakes the pointer into
+  the frames instead (server-side cursor).
 - The data-available event lets the capture path later query the cursor shape and
   position (`IddCxMonitorQueryHardwareCursor`) for a server-side-cursor mode; v1 only
   sets the plane up so the pointer stays out of the image. Each monitor uses its own

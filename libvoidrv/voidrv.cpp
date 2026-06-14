@@ -6,6 +6,7 @@
 #include <cfgmgr32.h>
 #include <new>
 #include <wchar.h>
+#include <stdio.h>
 
 // Both control-interface headers are self-contained and each #include <winioctl.h>,
 // whose device-interface GUIDs are emitted on EVERY include (outside its include
@@ -241,7 +242,9 @@ bool VoidrvDisplayRemove(VoidrvDisplayHandle handle, uint32_t index)
 // Apply a mode to the index-th active VoidDisplay monitor via the GDI display
 // config. Windows remembers the per-monitor mode in the registry, so the driver's
 // advertised mode is not enough on a re-add - we force the requested mode here.
-// Identifies VoidDisplay GDI devices by the "VVD" EDID id on their monitor child.
+// Identifies VoidDisplay GDI devices by the ADAPTER name ("Void Virtual Display
+// Adapter"), NOT the EDID manufacturer - a custom EDID (display.edid) changes the
+// monitor id but not the adapter, so adapter matching stays correct.
 // (Index is matched against active VoidDisplay devices in enumeration order; exact
 //  for the common single-display case.)
 static bool VoidApplyMode(uint32_t index, const VoidrvDisplayMode* mode)
@@ -253,14 +256,10 @@ static bool VoidApplyMode(uint32_t index, const VoidrvDisplayMode* mode)
     ZeroMemory(&dd, sizeof(dd));
     dd.cb = sizeof(dd);
     for (DWORD i = 0; count < VOIDRV_MAX_DISPLAYS && EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
-        if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
-            DISPLAY_DEVICEW mon;
-            ZeroMemory(&mon, sizeof(mon));
-            mon.cb = sizeof(mon);
-            if (EnumDisplayDevicesW(dd.DeviceName, 0, &mon, 0) && wcsstr(mon.DeviceID, L"VVD")) {
-                lstrcpynW(devices[count], dd.DeviceName, 32);
-                ++count;
-            }
+        if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
+            wcsstr(dd.DeviceString, L"Void Virtual Display")) {
+            lstrcpynW(devices[count], dd.DeviceName, 32);
+            ++count;
         }
         ZeroMemory(&dd, sizeof(dd));
         dd.cb = sizeof(dd);
@@ -372,107 +371,68 @@ bool VoidrvDisplayList(VoidrvDisplayHandle handle, VoidrvDisplayState* state)
     return true;
 }
 
-// The driver re-reads its custom-mode list from this key at adapter init, so the
-// IOCTL only changes the live list - we mirror the change here for persistence.
-static const wchar_t kVoidParamsKey[] =
-    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters";
+// VoidDisplay config file. The driver reads it at adapter init; the SDK writes it so
+// an unelevated controller can persist changes (the installer grants Users:Modify on
+// the folder). Best-effort: a write failure does not undo the live (IOCTL) change.
+static const wchar_t kVoidIniPath[] = L"C:\\ProgramData\\.voidrv\\display.ini";
 
-// Mirror a custom-mode add/remove into the driver's Parameters key so it survives
-// a device restart / reboot. Stored as a REG_BINARY array of packed
-// VoidrvDisplayMode triples. Best-effort: writing HKLM needs elevation, and a
-// failure here does not undo the live (IOCTL) change.
+// Mirror a custom-mode add/remove into [modes]Custom (comma-separated WxH@Hz) so it
+// survives a device restart / reboot.
 static void PersistCustomMode(const VoidrvDisplayMode* mode, bool add)
 {
+    wchar_t cur[1024] = {};
+    GetPrivateProfileStringW(L"modes", L"Custom", L"", cur, ARRAYSIZE(cur), kVoidIniPath);
+
+    // Rebuild the list, dropping any existing copy of this mode (so add re-appends at
+    // the end, and remove simply omits it).
     VoidrvDisplayMode list[VOIDRV_MAX_MODES];
-    DWORD cb = sizeof(list);
     DWORD count = 0;
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"CustomModes",
-                     RRF_RT_REG_BINARY, nullptr, list, &cb) == ERROR_SUCCESS) {
-        count = cb / (DWORD)sizeof(VoidrvDisplayMode);
-    }
-
-    DWORD found = count;
-    for (DWORD i = 0; i < count; ++i) {
-        if (list[i].Width == mode->Width && list[i].Height == mode->Height &&
-            list[i].RefreshHz == mode->RefreshHz) {
-            found = i;
-            break;
+    wchar_t* ctx = nullptr;
+    for (wchar_t* tok = wcstok_s(cur, L",;", &ctx); tok && count < VOIDRV_MAX_MODES;
+         tok = wcstok_s(nullptr, L",;", &ctx)) {
+        while (*tok == L' ') {
+            ++tok;
         }
-    }
-
-    if (add) {
-        if (found != count || count >= VOIDRV_MAX_MODES) {
-            return;  // already present, or full
-        }
-        list[count++] = *mode;
-    } else {
-        if (found == count) {
-            return;  // not present
-        }
-        for (DWORD i = found + 1; i < count; ++i) {
-            list[i - 1] = list[i];
-        }
-        --count;
-    }
-
-    RegSetKeyValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"CustomModes",
-                    REG_BINARY, list, count * (DWORD)sizeof(VoidrvDisplayMode));
-}
-
-// One persisted display, matching the driver's VoidPersistEntry layout.
-struct VoidrvPersistEntry {
-    uint32_t Index;
-    uint32_t Width;
-    uint32_t Height;
-    uint32_t RefreshHz;
-};
-
-// Mirror a display add / setmode / remove into the driver's Parameters key so the
-// driver recreates it at init (RestoreOnStart). Stored as a REG_BINARY array keyed
-// by slot index. Best-effort: the HKLM write needs elevation and a failure does
-// not affect the live operation.
-static void PersistDisplay(uint32_t index, const VoidrvDisplayMode* mode, bool present)
-{
-    VoidrvPersistEntry list[VOIDRV_MAX_DISPLAYS];
-    DWORD cb = sizeof(list);
-    DWORD count = 0;
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"PersistedDisplays",
-                     RRF_RT_REG_BINARY, nullptr, list, &cb) == ERROR_SUCCESS) {
-        count = cb / (DWORD)sizeof(VoidrvPersistEntry);
-    }
-
-    DWORD found = count;
-    for (DWORD i = 0; i < count; ++i) {
-        if (list[i].Index == index) {
-            found = i;
-            break;
-        }
-    }
-
-    if (present) {
-        if (found == count) {
-            if (count >= VOIDRV_MAX_DISPLAYS) {
-                return;  // full
+        unsigned w = 0, h = 0, hz = 0;
+        if (swscanf_s(tok, L"%ux%u@%u", &w, &h, &hz) >= 2 && w && h) {
+            if (hz == 0) hz = 60;
+            if (w == mode->Width && h == mode->Height && hz == mode->RefreshHz) {
+                continue;  // drop the existing copy
             }
-            list[count].Index = index;
-            found = count;
+            list[count].Width = w; list[count].Height = h; list[count].RefreshHz = hz;
             ++count;
         }
-        list[found].Width     = mode->Width;
-        list[found].Height    = mode->Height;
-        list[found].RefreshHz = mode->RefreshHz;
-    } else {
-        if (found == count) {
-            return;  // not present
-        }
-        for (DWORD i = found + 1; i < count; ++i) {
-            list[i - 1] = list[i];
-        }
-        --count;
+    }
+    if (add && count < VOIDRV_MAX_MODES) {
+        list[count++] = *mode;
     }
 
-    RegSetKeyValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"PersistedDisplays",
-                    REG_BINARY, list, count * (DWORD)sizeof(VoidrvPersistEntry));
+    wchar_t out[1024] = {};
+    for (DWORD i = 0; i < count; ++i) {
+        wchar_t one[40];
+        swprintf_s(one, ARRAYSIZE(one), L"%ux%u@%u",
+                   list[i].Width, list[i].Height, list[i].RefreshHz);
+        if (i) {
+            wcscat_s(out, ARRAYSIZE(out), L",");
+        }
+        wcscat_s(out, ARRAYSIZE(out), one);
+    }
+    WritePrivateProfileStringW(L"modes", L"Custom", count ? out : nullptr, kVoidIniPath);
+}
+
+// Mirror a display add / setmode / remove into [displays] (<slot> = WxH@Hz) so the
+// driver recreates it at init (RestoreOnStart).
+static void PersistDisplay(uint32_t index, const VoidrvDisplayMode* mode, bool present)
+{
+    wchar_t key[16];
+    swprintf_s(key, ARRAYSIZE(key), L"%u", index);
+    if (present) {
+        wchar_t val[40];
+        swprintf_s(val, ARRAYSIZE(val), L"%ux%u@%u", mode->Width, mode->Height, mode->RefreshHz);
+        WritePrivateProfileStringW(L"displays", key, val, kVoidIniPath);
+    } else {
+        WritePrivateProfileStringW(L"displays", key, nullptr, kVoidIniPath);  // delete the key
+    }
 }
 
 bool VoidrvDisplayAddMode(VoidrvDisplayHandle handle, const VoidrvDisplayMode* mode)
@@ -511,16 +471,16 @@ bool VoidrvDisplayRemoveMode(VoidrvDisplayHandle handle, const VoidrvDisplayMode
 
 bool VoidrvDisplayPersistenceWritable(void)
 {
-    // Probe write access to the Parameters key without side effects: opening for
-    // KEY_SET_VALUE succeeds only when the caller is elevated (the persistence
-    // writes go to the same key).
-    HKEY hk = nullptr;
-    LSTATUS rs = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVoidParamsKey, 0, KEY_SET_VALUE, &hk);
-    if (rs == ERROR_SUCCESS) {
-        RegCloseKey(hk);
-        return true;
+    // Can we write the config file? Opening it for write (no side effects -
+    // OPEN_EXISTING does not modify) succeeds only when the folder ACL grants this
+    // (possibly unelevated) caller write access.
+    HANDLE h = CreateFileW(kVoidIniPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
     }
-    return false;
+    CloseHandle(h);
+    return true;
 }
 
 bool VoidrvDisplayListModes(VoidrvDisplayHandle handle, VoidrvModeList* list)

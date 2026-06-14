@@ -1,4 +1,5 @@
 #include "VoidDisplay.h"
+#include "Config.h"
 
 using namespace Microsoft::WRL;
 
@@ -6,12 +7,6 @@ using namespace Microsoft::WRL;
 // but stable across reboots.
 static const GUID kVoidContainerBase =
     { 0x61912c91, 0x979a, 0x40e7, { 0xb4, 0x2a, 0xab, 0xf6, 0xd9, 0x17, 0xbf, 0xf3 } };
-
-// The driver's WUDF service Parameters key - source of the operator-tunable
-// settings the driver reads at init (render adapter, custom modes, persisted
-// displays, hardware cursor). The UMDF host can read it but not write it.
-static const wchar_t kVoidParamsKey[] =
-    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters";
 
 // ---------------------------------------------------------------------------
 // Mode-list helpers
@@ -38,22 +33,14 @@ static void FillTargetMode(IDDCX_TARGET_MODE& m, const VOID_MODE_DESC& d)
 //
 // On a multi-GPU headless host the OS would otherwise auto-pick the adapter
 // that composes the virtual desktop. We let the operator pin it by DXGI vendor
-// id via the driver's Parameters key:
-//   HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\VoidDisplay\
-//        Parameters\PreferredRenderAdapterVendorId  (REG_DWORD)
-//   0 or absent = auto; 0x10DE = NVIDIA, 0x1002 = AMD, 0x8086 = Intel.
+// id via display.ini: [render] PreferredAdapterVendorId (0 or absent = auto;
+// 0x10DE = NVIDIA, 0x1002 = AMD, 0x8086 = Intel).
 // Returns true and fills outLuid if a matching adapter is found.
 // ---------------------------------------------------------------------------
 static bool VoidResolveRenderAdapterLuid(LUID* outLuid)
 {
-    DWORD vendorId = 0;
-    DWORD cb = sizeof(vendorId);
-    LSTATUS rs = RegGetValueW(
-        HKEY_LOCAL_MACHINE,
-        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters",
-        L"PreferredRenderAdapterVendorId",
-        RRF_RT_REG_DWORD, nullptr, &vendorId, &cb);
-    if (rs != ERROR_SUCCESS || vendorId == 0) {
+    DWORD vendorId = VoidIniUInt(L"render", L"PreferredAdapterVendorId", 0);
+    if (vendorId == 0) {
         return false;  // auto
     }
 
@@ -492,16 +479,11 @@ void VoidDisplayDevice::FinishInit(IDDCX_ADAPTER adapter)
         VOID_LOG("Pinned render adapter");
     }
 
-    // Hardware cursor: on by default. With a hardware-cursor plane the OS draws
-    // the pointer as an overlay instead of compositing it into the captured
-    // frames, so remote-desktop apps that render their own client-side cursor do
-    // not show a double pointer. Set HardwareCursorEnabled=0 to bake the cursor
-    // into the frames instead (server-side cursor).
-    DWORD hwc = 1;
-    DWORD hwcb = sizeof(hwc);
-    RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"HardwareCursorEnabled",
-                 RRF_RT_REG_DWORD, NULL, &hwc, &hwcb);
-    m_HardwareCursor = (hwc != 0);
+    // Hardware cursor: on by default. With a hardware-cursor plane the OS draws the
+    // pointer as an overlay instead of compositing it into the captured frames, so
+    // remote-desktop apps that render their own client-side cursor do not show a
+    // double pointer. [cursor]HardwareCursor=0 bakes the cursor in (server-side).
+    m_HardwareCursor = (VoidIniUInt(L"cursor", L"HardwareCursor", 1) != 0);
 
     // Seed any SDK-persisted custom modes so they are advertised the moment a
     // monitor arrives (survives device restart / reboot). Defaults are always
@@ -516,8 +498,22 @@ void VoidDisplayDevice::FinishInit(IDDCX_ADAPTER adapter)
 
 NTSTATUS VoidDisplayDevice::CreateMonitorLocked(UINT32 index, const VOIDDISPLAY_MODE& mode)
 {
-    UINT8 edid[VOIDDISPLAY_EDID_SIZE];
-    VoidBuildEdid(edid, 0x56564400u + index);  // "VVD" + slot
+    // EDID: an operator-supplied display.edid if [edid]UseCustomEdid=1 and it is
+    // valid, otherwise the built-in VVD template. Serial is per-slot so monitors
+    // are distinct ("VVD" + slot).
+    UINT8  edid[VOIDDISPLAY_EDID_MAX];
+    UINT32 serial   = 0x56564400u + index;
+    UINT32 edidSize = 0;
+    if (VoidIniUInt(L"edid", L"UseCustomEdid", 0) != 0) {
+        edidSize = VoidLoadCustomEdid(edid, serial, VoidIniUInt(L"edid", L"PatchSerial", 1) != 0);
+        if (edidSize != 0) {
+            VOID_LOG("Using custom EDID (%u bytes) for slot %u", edidSize, index);
+        }
+    }
+    if (edidSize == 0) {
+        VoidBuildEdid(edid, serial);
+        edidSize = VOIDDISPLAY_EDID_SIZE;
+    }
 
     IDDCX_MONITOR_INFO info = {};
     info.Size                       = sizeof(info);
@@ -529,7 +525,7 @@ NTSTATUS VoidDisplayDevice::CreateMonitorLocked(UINT32 index, const VOIDDISPLAY_
     info.ConnectorIndex             = index;
     info.MonitorDescription.Size    = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type    = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    info.MonitorDescription.DataSize = VOIDDISPLAY_EDID_SIZE;
+    info.MonitorDescription.DataSize = edidSize;
     info.MonitorDescription.pData   = edid;
     info.MonitorContainerId         = kVoidContainerBase;
     info.MonitorContainerId.Data4[7] = (UINT8)(kVoidContainerBase.Data4[7] + index);
@@ -746,57 +742,36 @@ void VoidDisplayDevice::GetState(VOIDDISPLAY_STATE* out)
     WdfWaitLockRelease(m_Lock);
 }
 
-// On-disk form of one persisted display: its slot index plus mode. The SDK writes
-// a REG_BINARY array of these under the driver's WUDF service Parameters key (the
-// UMDF host itself has no registry write rights); the driver reads it here. Same
-// key the driver reads PreferredRenderAdapterVendorId and the custom modes from.
-struct VoidPersistEntry
-{
-    UINT32 Index;
-    UINT32 Width;
-    UINT32 Height;
-    UINT32 RefreshHz;
-};
-
-// Recreate displays the SDK persisted to the Parameters key. Called once at
-// adapter init,
-// after the custom modes are loaded and before any control IOCTL is served. Gated
-// on RestoreOnStart (REG_DWORD; absent or non-zero means restore).
+// Recreate displays the SDK persisted to display.ini. Called once at adapter init,
+// after the custom modes are loaded and before any control IOCTL is served. Gated on
+// [startup]RestoreOnStart (absent or non-zero = restore). The [displays] section is
+// "<slot> = WxH@Hz" pairs written by the SDK.
 void VoidDisplayDevice::RestoreDisplays()
 {
-    DWORD restore = 1;  // default on; left unchanged when the value is absent
-    DWORD cb = sizeof(restore);
-    RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"RestoreOnStart",
-                 RRF_RT_REG_DWORD, NULL, &restore, &cb);
-    if (restore == 0) {
+    if (VoidIniUInt(L"startup", L"RestoreOnStart", 1) == 0) {
         VOID_LOG("RestoreOnStart=0; not restoring displays");
         return;
     }
 
-    VoidPersistEntry entries[VOIDDISPLAY_MAX_DISPLAYS];
-    DWORD byteLen = sizeof(entries);
-    LSTATUS rs = RegGetValueW(HKEY_LOCAL_MACHINE, kVoidParamsKey, L"PersistedDisplays",
-                              RRF_RT_REG_BINARY, NULL, entries, &byteLen);
-    if (rs != ERROR_SUCCESS || byteLen == 0) {
+    wchar_t section[2048] = {};
+    if (GetPrivateProfileSectionW(L"displays", section, ARRAYSIZE(section), VOID_INI_PATH) == 0) {
         return;  // none persisted
     }
 
-    UINT32 count    = byteLen / (DWORD)sizeof(VoidPersistEntry);
     UINT32 restored = 0;
     WdfWaitLockAcquire(m_Lock, NULL);
-    for (UINT32 i = 0; i < count; ++i) {
-        UINT32 idx = entries[i].Index;
+    for (const wchar_t* p = section; *p != L'\0'; p += wcslen(p) + 1) {
+        const wchar_t* eq = wcschr(p, L'=');
+        if (!eq) {
+            continue;
+        }
+        UINT32 idx = (UINT32)wcstoul(p, nullptr, 10);   // "<slot>=..."
         if (idx >= VOIDDISPLAY_MAX_DISPLAYS || m_Slots[idx].InUse) {
             continue;  // bad index or slot already taken
         }
         VOIDDISPLAY_MODE mode;
-        mode.Width     = entries[i].Width;
-        mode.Height    = entries[i].Height;
-        mode.RefreshHz = entries[i].RefreshHz;
-        if (mode.Width == 0 || mode.Height == 0 || mode.RefreshHz == 0) {
-            mode.Width     = VOID_DEFAULT_WIDTH;
-            mode.Height    = VOID_DEFAULT_HEIGHT;
-            mode.RefreshHz = VOID_DEFAULT_REFRESH;
+        if (!VoidParseModeStr(eq + 1, &mode.Width, &mode.Height, &mode.RefreshHz)) {
+            continue;
         }
         VoidModesAdd(mode.Width, mode.Height, mode.RefreshHz);  // ensure advertised
         if (NT_SUCCESS(CreateMonitorLocked(idx, mode))) {
@@ -804,7 +779,7 @@ void VoidDisplayDevice::RestoreDisplays()
         }
     }
     WdfWaitLockRelease(m_Lock);
-    VOID_LOG("Restored %u of %u persisted display(s)", restored, count);
+    VOID_LOG("Restored %u display(s) from ini", restored);
 }
 
 NTSTATUS VoidDisplayDevice::AddMode(const VOIDDISPLAY_MODE& mode)

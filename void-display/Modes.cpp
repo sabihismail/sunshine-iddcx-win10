@@ -1,4 +1,7 @@
 #include "Modes.h"
+#include "Config.h"
+
+#include <wchar.h>   // wcstok_s
 
 // Default mode set advertised on every VoidDisplay monitor. The first entry is
 // the default (1920x1080 @ 60) and stays first - it is reported as the preferred
@@ -197,24 +200,23 @@ bool VoidModesContains(UINT32 width, UINT32 height, UINT32 hz)
     return found;
 }
 
-// Load custom modes the SDK persisted under the driver's WUDF service Parameters
-// key so they survive a device restart or reboot. The value is a REG_BINARY
-// array of packed {Width, Height, RefreshHz} UINT32 triples (one VOID_MODE_DESC
-// each). Read at adapter init, before any monitor arrives.
+// Load custom modes the SDK persisted to display.ini so they survive a device
+// restart or reboot: [modes] Custom = WxH@Hz, WxH@Hz, ... Read at adapter init,
+// before any monitor arrives.
 void VoidModesLoadPersisted(void)
 {
-    VOID_MODE_DESC buf[VOID_MAX_CUSTOM_MODES];
-    DWORD cb = sizeof(buf);
-    LSTATUS rs = RegGetValueW(
-        HKEY_LOCAL_MACHINE,
-        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\VoidDisplay\\Parameters",
-        L"CustomModes",
-        RRF_RT_REG_BINARY, NULL, buf, &cb);
-    if (rs != ERROR_SUCCESS) {
+    wchar_t buf[1024] = {};
+    if (GetPrivateProfileStringW(L"modes", L"Custom", L"", buf, ARRAYSIZE(buf), VOID_INI_PATH) == 0) {
         return;  // none persisted
     }
-    unsigned n = (unsigned)(cb / sizeof(VOID_MODE_DESC));
-    for (unsigned i = 0; i < n; ++i) {
-        VoidModesAdd(buf[i].Width, buf[i].Height, buf[i].RefreshHz);
+    wchar_t* ctx = nullptr;
+    for (wchar_t* tok = wcstok_s(buf, L",;", &ctx); tok != nullptr; tok = wcstok_s(nullptr, L",;", &ctx)) {
+        while (*tok == L' ') {
+            ++tok;  // skip leading spaces after a separator
+        }
+        UINT32 w = 0, h = 0, hz = 0;
+        if (VoidParseModeStr(tok, &w, &h, &hz)) {
+            VoidModesAdd(w, h, hz);
+        }
     }
 }
