@@ -73,6 +73,13 @@ bool                VoidrvDisplayRemove(VoidrvDisplayHandle handle, uint32_t ind
 bool                VoidrvDisplaySetMode(VoidrvDisplayHandle handle, uint32_t index,
                                          const VoidrvDisplayMode* mode);
 
+/* Set a display's mode, advertising it on the fly if not already in the list (for
+   on-resize / arbitrary resolutions, like a VM resizing its screen). Width/height
+   are rounded to even and clamped to <= 4096x2160 / 24..165 Hz. Unlike SetMode this
+   is ephemeral - it is NOT persisted across an adapter restart. */
+bool                VoidrvDisplaySetModeDynamic(VoidrvDisplayHandle handle, uint32_t index,
+                                                const VoidrvDisplayMode* mode);
+
 /* Read the current display table. */
 bool                VoidrvDisplayList(VoidrvDisplayHandle handle, VoidrvDisplayState* state);
 

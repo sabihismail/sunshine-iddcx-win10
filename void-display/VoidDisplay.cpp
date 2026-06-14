@@ -238,6 +238,12 @@ VOID VoidDisplayIoDeviceControl(WDFDEVICE Device, WDFREQUEST Request,
         if (NT_SUCCESS(status)) { status = dev->SetMode(in->Index, in->Mode); }
         break;
     }
+    case IOCTL_VOIDDISPLAY_SET_MODE_DYNAMIC: {
+        VOIDDISPLAY_SET_MODE* in = nullptr;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(VOIDDISPLAY_SET_MODE), (PVOID*)&in, nullptr);
+        if (NT_SUCCESS(status)) { status = dev->SetModeDynamic(in->Index, in->Mode); }
+        break;
+    }
     case IOCTL_VOIDDISPLAY_LIST: {
         VOIDDISPLAY_STATE* out = nullptr;
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(VOIDDISPLAY_STATE), (PVOID*)&out, nullptr);
@@ -646,6 +652,84 @@ NTSTATUS VoidDisplayDevice::SetMode(UINT32 index, const VOIDDISPLAY_MODE& mode)
     }
     WdfWaitLockRelease(m_Lock);
     return status;
+}
+
+// Like SetMode but for on-the-fly resolutions (e.g. a client window resize). The
+// set of settable resolutions is fixed when the monitor arrives (ParseMonitorDescription),
+// so a brand-new mode is only exposed by re-plugging the monitor; an already-advertised
+// mode (a default or one added earlier) is settable directly with no re-plug. Not
+// persisted: dynamic modes are ephemeral and do not change the restore-on-start state.
+NTSTATUS VoidDisplayDevice::SetModeDynamic(UINT32 index, const VOIDDISPLAY_MODE& mode)
+{
+    if (index >= VOIDDISPLAY_MAX_DISPLAYS) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (mode.Width == 0 || mode.Height == 0 || mode.RefreshHz == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    bool wasAdvertised = VoidModesContains(mode.Width, mode.Height, mode.RefreshHz);
+    VoidModesAdd(mode.Width, mode.Height, mode.RefreshHz);
+
+    WdfWaitLockAcquire(m_Lock, NULL);
+    NTSTATUS status = STATUS_NOT_FOUND;
+    bool replug = false;
+    if (m_Slots[index].InUse) {
+        m_Slots[index].Mode = mode;
+        replug = !wasAdvertised;   // a new resolution needs a re-plug to be settable
+        status = STATUS_SUCCESS;
+    }
+    WdfWaitLockRelease(m_Lock);
+
+    if (NT_SUCCESS(status) && replug) {
+        ReplugMonitor(index);
+    }
+    return status;
+}
+
+// Depart and re-create a live monitor in the same slot. The identity (ContainerId +
+// EDID serial) is derived from the slot index, so the OS sees the same monitor return -
+// but ParseMonitorDescription runs again, which is the only way a newly-added
+// resolution becomes settable on a live display. This is a single-monitor hotplug:
+// it blinks only this monitor, NOT the whole desktop (unlike IddCxMonitorUpdateModes,
+// which forces a global topology re-evaluation and modesets the other displays).
+void VoidDisplayDevice::ReplugMonitor(UINT32 index)
+{
+    IDDCX_MONITOR                       oldMonitor  = nullptr;
+    std::unique_ptr<SwapChainProcessor> processor;
+    HANDLE                              cursorEvent = nullptr;
+    VOIDDISPLAY_MODE                    mode{};
+
+    WdfWaitLockAcquire(m_Lock, NULL);
+    if (index < VOIDDISPLAY_MAX_DISPLAYS && m_Slots[index].InUse) {
+        oldMonitor  = m_Slots[index].Monitor;
+        processor   = std::move(m_Slots[index].Processor);
+        cursorEvent = m_Slots[index].CursorEvent;
+        mode        = m_Slots[index].Mode;
+        m_Slots[index].Monitor     = nullptr;
+        m_Slots[index].CursorEvent = nullptr;
+        m_Slots[index].InUse       = false;
+    }
+    WdfWaitLockRelease(m_Lock);
+
+    if (!oldMonitor) {
+        return;
+    }
+
+    // Tear down OUTSIDE the lock: departure re-enters EvtIddCxMonitorUnassignSwapChain,
+    // which takes m_Lock (the same deadlock as RemoveMonitor).
+    processor.reset();
+    if (cursorEvent) {
+        CloseHandle(cursorEvent);
+    }
+    IddCxMonitorDeparture(oldMonitor);
+
+    // Re-create in the same slot with the refreshed (now larger) mode list.
+    WdfWaitLockAcquire(m_Lock, NULL);
+    NTSTATUS status = CreateMonitorLocked(index, mode);
+    WdfWaitLockRelease(m_Lock);
+    VOID_LOG("Replug slot %u %ux%u@%u status=0x%08X",
+             index, mode.Width, mode.Height, mode.RefreshHz, status);
 }
 
 void VoidDisplayDevice::GetState(VOIDDISPLAY_STATE* out)

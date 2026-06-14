@@ -307,6 +307,49 @@ bool VoidrvDisplaySetMode(VoidrvDisplayHandle handle, uint32_t index, const Void
     return applied;
 }
 
+bool VoidrvDisplaySetModeDynamic(VoidrvDisplayHandle handle, uint32_t index,
+                                 const VoidrvDisplayMode* mode)
+{
+    if (!handle || !mode) {
+        return false;
+    }
+
+    // Round to even (hardware encoders and the OS prefer it) and clamp to a sane
+    // range: <= 4096x2160, 24..165 Hz.
+    VoidrvDisplayMode m = *mode;
+    m.Width  &= ~1u;
+    m.Height &= ~1u;
+    if (m.Width  < 320u)   m.Width  = 320u;
+    if (m.Height < 240u)   m.Height = 240u;
+    if (m.Width  > 4096u)  m.Width  = 4096u;
+    if (m.Height > 2160u)  m.Height = 2160u;
+    if (m.RefreshHz < 24u)  m.RefreshHz = 24u;
+    if (m.RefreshHz > 165u) m.RefreshHz = 165u;
+
+    // Advertise + refresh the live monitor so the OS accepts the mode...
+    VOIDDISPLAY_SET_MODE wire;
+    ZeroMemory(&wire, sizeof(wire));
+    wire.Index = index;
+    wire.Mode.Width = m.Width;
+    wire.Mode.Height = m.Height;
+    wire.Mode.RefreshHz = m.RefreshHz;
+    if (!Control(handle->Device, IOCTL_VOIDDISPLAY_SET_MODE_DYNAMIC, &wire, sizeof(wire),
+                 nullptr, 0, nullptr)) {
+        return false;
+    }
+
+    // ...then switch the OS resolution. If the driver re-plugged the monitor to expose
+    // a new mode, the re-arrived display takes a moment to enumerate, so retry briefly.
+    // Ephemeral: not persisted on purpose.
+    for (int tries = 0; tries < 12; ++tries) {
+        if (VoidApplyMode(index, &m)) {
+            return true;
+        }
+        Sleep(150);
+    }
+    return false;
+}
+
 bool VoidrvDisplayList(VoidrvDisplayHandle handle, VoidrvDisplayState* state)
 {
     if (!handle || !state) {

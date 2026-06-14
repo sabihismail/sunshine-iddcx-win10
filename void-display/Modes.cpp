@@ -183,6 +183,20 @@ unsigned VoidModesCount(void)
     return n;
 }
 
+bool VoidModesContains(UINT32 width, UINT32 height, UINT32 hz)
+{
+    if (IsDefaultMode(width, height, hz)) {
+        return true;
+    }
+    bool found = false;
+    AcquireSRWLockShared(&s_modeLock);
+    for (unsigned i = 0; i < s_customCount; ++i) {
+        if (SameMode(s_customModes[i], width, height, hz)) { found = true; break; }
+    }
+    ReleaseSRWLockShared(&s_modeLock);
+    return found;
+}
+
 // Load custom modes the SDK persisted under the driver's WUDF service Parameters
 // key so they survive a device restart or reboot. The value is a REG_BINARY
 // array of packed {Width, Height, RefreshHz} UINT32 triples (one VOID_MODE_DESC

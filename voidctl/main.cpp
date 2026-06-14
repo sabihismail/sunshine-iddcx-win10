@@ -39,6 +39,7 @@ static int Usage()
         "  voidctl display add [WxH@Hz]      (e.g. add 1920x1080@60; omit for default)\n"
         "  voidctl display remove <index>\n"
         "  voidctl display setmode <index> <WxH@Hz>\n"
+        "  voidctl display setdyn <index> <WxH@Hz>   (advertise on the fly; not persisted)\n"
         "  voidctl display modes             (list advertised modes)\n"
         "  voidctl display addmode <WxH@Hz>\n"
         "  voidctl display removemode <WxH@Hz>\n"
@@ -196,6 +197,30 @@ static int CmdSetMode(int argc, char** argv)
     }
     bool ok = VoidrvDisplaySetMode(h, index, &mode);
     std::printf(ok ? "set mode on display %u\n" : "error: setmode failed\n", index);
+    VoidrvDisplayClose(h);
+    return ok ? 0 : 1;
+}
+
+static int CmdSetModeDynamic(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::printf("error: setdyn needs <index> <WxH@Hz>\n");
+        return 1;
+    }
+    uint32_t index = (uint32_t)std::strtoul(argv[0], nullptr, 10);
+    VoidrvDisplayMode mode;
+    std::memset(&mode, 0, sizeof(mode));
+    if (!ParseMode(argv[1], &mode)) {
+        std::printf("error: bad mode '%s'\n", argv[1]);
+        return 1;
+    }
+    VoidrvDisplayHandle h = VoidrvDisplayOpen();
+    if (!h) {
+        std::printf("error: cannot open VoidDisplay\n");
+        return 1;
+    }
+    bool ok = VoidrvDisplaySetModeDynamic(h, index, &mode);
+    std::printf(ok ? "set dynamic mode on display %u\n" : "error: setdyn failed\n", index);
     VoidrvDisplayClose(h);
     return ok ? 0 : 1;
 }
@@ -694,6 +719,7 @@ int main(int argc, char** argv)
     else if (std::strcmp(cmd, "add") == 0)        { rc = CmdAdd(rest_argc, rest_argv); persists = true; }
     else if (std::strcmp(cmd, "remove") == 0)     { rc = CmdRemove(rest_argc, rest_argv); persists = true; }
     else if (std::strcmp(cmd, "setmode") == 0)    { rc = CmdSetMode(rest_argc, rest_argv); persists = true; }
+    else if (std::strcmp(cmd, "setdyn") == 0)     rc = CmdSetModeDynamic(rest_argc, rest_argv);
     else if (std::strcmp(cmd, "modes") == 0)      rc = CmdModes();
     else if (std::strcmp(cmd, "addmode") == 0)    { rc = CmdAddRemoveMode(rest_argc, rest_argv, true); persists = true; }
     else if (std::strcmp(cmd, "removemode") == 0) { rc = CmdAddRemoveMode(rest_argc, rest_argv, false); persists = true; }

@@ -98,6 +98,7 @@ public:
     NTSTATUS AddMonitor(const VOIDDISPLAY_MODE& mode, UINT32* outIndex);
     NTSTATUS RemoveMonitor(UINT32 index);
     NTSTATUS SetMode(UINT32 index, const VOIDDISPLAY_MODE& mode);
+    NTSTATUS SetModeDynamic(UINT32 index, const VOIDDISPLAY_MODE& mode);
     void     GetState(VOIDDISPLAY_STATE* out);
 
     NTSTATUS AddMode(const VOIDDISPLAY_MODE& mode);
@@ -114,6 +115,7 @@ public:
 private:
     NTSTATUS CreateMonitorLocked(UINT32 index, const VOIDDISPLAY_MODE& mode);
     void     RestoreDisplays();   // recreate SDK-persisted displays at init (RestoreOnStart)
+    void     ReplugMonitor(UINT32 index);  // depart + re-create a monitor to refresh its mode list
 
     WDFDEVICE       m_WdfDevice;
     IDDCX_ADAPTER   m_Adapter;

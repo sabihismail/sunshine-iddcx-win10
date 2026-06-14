@@ -59,6 +59,10 @@ unsigned VoidModesGet(VOID_MODE_DESC* out, unsigned cap);
 /* Total advertised mode count (defaults + custom). */
 unsigned VoidModesCount(void);
 
+/* True if (w, h, hz) is already advertised (a built-in default or an added custom
+ * mode). Used to decide whether a live monitor must re-plug to expose a new mode. */
+bool VoidModesContains(UINT32 width, UINT32 height, UINT32 hz);
+
 /* Seed the custom-mode store from the SDK-persisted list in the driver's WUDF
  * service Parameters key (REG_BINARY of packed {w, h, hz} triples). Call once at
  * adapter init, before the first monitor arrives. No-op if nothing is persisted. */

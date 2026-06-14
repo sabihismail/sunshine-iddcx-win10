@@ -86,6 +86,9 @@ Private interface GUID `{40255101-a910-441c-84d6-9f027197fa70}`. All codes use
 
 // List advertised modes (defaults + custom). Out: VOIDDISPLAY_MODE_LIST.
 #define IOCTL_VOIDDISPLAY_LIST_MODES  VOIDDISPLAY_IOCTL(8, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+// Set a mode on a live display, advertising it on the fly if new. In: VOIDDISPLAY_SET_MODE.
+#define IOCTL_VOIDDISPLAY_SET_MODE_DYNAMIC  VOIDDISPLAY_IOCTL(9, FILE_WRITE_ACCESS)
 ```
 
 ```c
@@ -122,11 +125,20 @@ Semantics:
 - `REMOVE` departs the monitor in that slot and frees it. Idempotent on an empty
   slot.
 - `SET_MODE` updates the active mode of an existing display and re-advertises it.
+- `SET_MODE_DYNAMIC` sets a mode on a live display for on-resize / arbitrary
+  resolutions. The settable resolution list is fixed at monitor arrival
+  (`ParseMonitorDescription`), so a brand-new mode is exposed by re-plugging that one
+  monitor (a single-monitor hotplug - it blinks only that display, not the desktop;
+  `IddCxMonitorUpdateModes` is deliberately NOT used because it forces a global
+  topology re-evaluation that modesets the other monitors). An already-advertised mode
+  is set directly with no re-plug. The SDK rounds to even and clamps to <= 4096x2160 /
+  24..165 Hz, and does not persist it (dynamic modes are ephemeral).
 - `LIST` returns the current table.
 - `ADD_MODE` / `REMOVE_MODE` add or remove a custom resolution+refresh from the
-  advertised mode list (built-in defaults always remain). After a change, live
-  monitors are re-arrived so the OS re-queries and the new mode appears in display
-  settings. `LIST_MODES` returns the full advertised list (defaults + custom).
+  advertised mode list (built-in defaults always remain). The change applies to
+  displays surfaced afterward; a live display picks up a new mode only via
+  `SET_MODE_DYNAMIC` (or a remove/re-add). `LIST_MODES` returns the full advertised
+  list (defaults + custom).
 - The advertised list is a process-global store (the `ParseMonitorDescription`
   callback has no per-monitor context), so custom modes apply to every VoidDisplay
   monitor. Custom modes are durable: the SDK mirrors each `ADD_MODE`/`REMOVE_MODE`

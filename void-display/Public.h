@@ -47,6 +47,11 @@ DEFINE_GUID(GUID_DEVINTERFACE_VOIDDISPLAY,
 /* List the advertised modes (defaults + custom). Out: VOIDDISPLAY_MODE_LIST. */
 #define IOCTL_VOIDDISPLAY_LIST_MODES  VOIDDISPLAY_IOCTL(8, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
+/* Advertise a mode on a live display without re-plugging it (the OS re-reads the
+   mode list so the mode becomes immediately settable). For dynamic/on-resize
+   resolution changes. In: VOIDDISPLAY_SET_MODE. */
+#define IOCTL_VOIDDISPLAY_SET_MODE_DYNAMIC  VOIDDISPLAY_IOCTL(9, FILE_WRITE_ACCESS)
+
 #include <pshpack1.h>
 
 typedef struct _VOIDDISPLAY_MODE {
