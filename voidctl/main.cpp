@@ -8,6 +8,7 @@
  *   voidctl display add [WxH@Hz]
  *   voidctl display remove <index>
  *   voidctl display setmode <index> <WxH@Hz>
+ *   voidctl display sunshine-config [slot] [sunshine.conf]  (stable output_name)
  *   voidctl mouse status | version
  *   voidctl mouse move <dx> <dy>
  *   voidctl mouse demo [seconds]
@@ -22,6 +23,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <string>
+#include <vector>
+#include <fstream>
 
 static void PrintLastError(const char* what)
 {
@@ -44,6 +47,8 @@ static int Usage()
         "  voidctl display modes             (list advertised modes)\n"
         "  voidctl display addmode <WxH@Hz>\n"
         "  voidctl display removemode <WxH@Hz>\n"
+        "  voidctl display sunshine-config [slot] [sunshine.conf]\n"
+        "                                    (print, or patch, the stable output_name)\n"
         "\n"
         "  voidctl mouse status\n"
         "  voidctl mouse version\n"
@@ -130,53 +135,41 @@ static int ParseMonitorUid(const wchar_t* path)
     return uid;
 }
 
-// Surface the Windows-side identity of each Void monitor that GDI can see: the
-// adapter's GDI device name (\\.\DISPLAYn - this is what a stream host like Sunshine
-// puts in output_name, but it is VOLATILE: Windows reassigns the ordinal across
-// reboots / GPU hotplug / monitor add-remove) and the monitor's stable device-
-// interface path plus its UID. Pin the device path or UID in host config, not
-// \\.\DISPLAYn. Detached Void monitors are not enumerable via GDI, so this lists
-// only currently-attached ones.
-static void PrintVoidGdiMonitors()
+// Find the GDI device name (\\.\DISPLAYn) and stable monitor device-interface path
+// for the Void monitor occupying driver slot `slot`, matching it by UID (= 0x100 +
+// slot). Returns false if that slot has no GDI-attached monitor (detached / not
+// added). The device path is the durable identifier; \\.\DISPLAYn is volatile.
+static bool FindVoidMonitorForSlot(uint32_t slot,
+                                   wchar_t* deviceName, int deviceNameCch,
+                                   wchar_t* path, int pathCch)
 {
-    std::printf("\nWindows display devices (Void), as GDI sees them now:\n");
+    const int wantUid = 0x100 + (int)slot;
 
     DISPLAY_DEVICEW adapter;
     ZeroMemory(&adapter, sizeof(adapter));
     adapter.cb = sizeof(adapter);
 
-    bool any = false;
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i) {
         if (wcsstr(adapter.DeviceString, L"Void Virtual Display")) {
-            const char* primary = (adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? " (primary)" : "";
-            const char* active  = (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? "" : " (detached)";
-
             DISPLAY_DEVICEW mon;
             ZeroMemory(&mon, sizeof(mon));
             mon.cb = sizeof(mon);
-            bool hadMon = false;
             for (DWORD j = 0;
                  EnumDisplayDevicesW(adapter.DeviceName, j, &mon, EDD_GET_DEVICE_INTERFACE_NAME);
                  ++j) {
-                std::printf("  %ls%s%s\n", adapter.DeviceName, primary, active);
-                std::printf("      uid=%d  path=%ls\n", ParseMonitorUid(mon.DeviceID), mon.DeviceID);
-                hadMon = true;
+                if (ParseMonitorUid(mon.DeviceID) == wantUid) {
+                    lstrcpynW(deviceName, adapter.DeviceName, deviceNameCch);
+                    lstrcpynW(path, mon.DeviceID, pathCch);
+                    return true;
+                }
                 ZeroMemory(&mon, sizeof(mon));
                 mon.cb = sizeof(mon);
             }
-            if (!hadMon) {
-                std::printf("  %ls%s%s  (no monitor child enumerated)\n", adapter.DeviceName, primary, active);
-            }
-            any = true;
         }
         ZeroMemory(&adapter, sizeof(adapter));
         adapter.cb = sizeof(adapter);
     }
-
-    if (!any) {
-        std::printf("  (none attached - 'display add' one first; detached monitors do not\n"
-                    "   appear here, only ones Windows has attached to the desktop)\n");
-    }
+    return false;
 }
 
 static int CmdList()
@@ -193,16 +186,104 @@ static int CmdList()
         VoidrvDisplayClose(h);
         return 1;
     }
-    std::printf("displays in use: %u\n", st.Count);
+    std::printf("displays in use: %u/%u\n", st.Count, (uint32_t)VOIDRV_MAX_DISPLAYS);
     for (uint32_t i = 0; i < VOIDRV_MAX_DISPLAYS; ++i) {
-        if (st.Entries[i].InUse) {
-            std::printf("  [%u] %ux%u@%u\n", i,
-                        st.Entries[i].Mode.Width, st.Entries[i].Mode.Height,
-                        st.Entries[i].Mode.RefreshHz);
+        if (!st.Entries[i].InUse) {
+            continue;
+        }
+        std::printf("  [%u] %ux%u@%u\n", i,
+                    st.Entries[i].Mode.Width, st.Entries[i].Mode.Height,
+                    st.Entries[i].Mode.RefreshHz);
+
+        wchar_t deviceName[32];
+        wchar_t path[256];
+        if (FindVoidMonitorForSlot(i, deviceName, ARRAYSIZE(deviceName), path, ARRAYSIZE(path))) {
+            std::printf("   |__ Device: %ls\n", deviceName);
+            std::printf("   |__ Path: %ls\n", path);
+        } else {
+            std::printf("   |__ (not attached to the desktop)\n");
         }
     }
-    PrintVoidGdiMonitors();
     VoidrvDisplayClose(h);
+    return 0;
+}
+
+// Convert a wide device path (pure ASCII in practice) to a narrow UTF-8 string.
+static std::string Narrow(const wchar_t* w)
+{
+    if (!w) {
+        return std::string();
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) {
+        return std::string();
+    }
+    std::string s((size_t)(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// Print (or patch into sunshine.conf) the stable output_name for a Void slot. The
+// device path survives reboots and display re-adds (the UID = 0x100 + slot and the
+// adapter devnode are fixed); pin it instead of \\.\DISPLAYn, which Windows renumbers.
+// Re-confirm only after a VoidDisplay driver REINSTALL (which can rotate the path).
+static int CmdSunshineConfig(int argc, char** argv)
+{
+    uint32_t    slot     = (argc > 0) ? (uint32_t)std::strtoul(argv[0], nullptr, 10) : 0;
+    const char* confPath = (argc > 1) ? argv[1] : nullptr;
+
+    wchar_t deviceName[32];
+    wchar_t path[256];
+    if (!FindVoidMonitorForSlot(slot, deviceName, ARRAYSIZE(deviceName), path, ARRAYSIZE(path))) {
+        std::printf("error: slot %u has no attached Void monitor - 'display add' it first\n", slot);
+        return 1;
+    }
+    std::string narrowPath = Narrow(path);
+
+    if (!confPath) {
+        std::printf("# Sunshine output_name for Void display slot %u (stable across reboots):\n", slot);
+        std::printf("output_name = %s\n", narrowPath.c_str());
+        std::printf("\n(pin this device path, NOT %ls which Windows renumbers.\n", deviceName);
+        std::printf(" pass your sunshine.conf path as a 2nd arg to patch it in place.)\n");
+        return 0;
+    }
+
+    // Patch: replace an existing output_name line, else append one.
+    std::ifstream in(confPath);
+    if (!in) {
+        std::printf("error: cannot open '%s' for reading\n", confPath);
+        return 1;
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    bool replaced = false;
+    while (std::getline(in, line)) {
+        size_t s = line.find_first_not_of(" \t");
+        bool isKey = (s != std::string::npos) && line.compare(s, 11, "output_name") == 0 &&
+                     (s + 11 >= line.size() || line[s + 11] == ' ' ||
+                      line[s + 11] == '\t' || line[s + 11] == '=');
+        if (isKey) {
+            lines.push_back("output_name = " + narrowPath);
+            replaced = true;
+        } else {
+            lines.push_back(line);
+        }
+    }
+    in.close();
+    if (!replaced) {
+        lines.push_back("output_name = " + narrowPath);
+    }
+
+    std::ofstream out(confPath, std::ios::trunc);
+    if (!out) {
+        std::printf("error: cannot open '%s' for writing\n", confPath);
+        return 1;
+    }
+    for (const auto& l : lines) {
+        out << l << "\n";
+    }
+    std::printf("patched %s: output_name = %s (%s)\n",
+                confPath, narrowPath.c_str(), replaced ? "replaced" : "appended");
     return 0;
 }
 
@@ -839,6 +920,7 @@ int main(int argc, char** argv)
     else if (std::strcmp(cmd, "modes") == 0)      rc = CmdModes();
     else if (std::strcmp(cmd, "addmode") == 0)    { rc = CmdAddRemoveMode(rest_argc, rest_argv, true); persists = true; }
     else if (std::strcmp(cmd, "removemode") == 0) { rc = CmdAddRemoveMode(rest_argc, rest_argv, false); persists = true; }
+    else if (std::strcmp(cmd, "sunshine-config") == 0) rc = CmdSunshineConfig(rest_argc, rest_argv);
     else return Usage();
 
     // The live operation went through the driver, but saving it for restore-on-start
