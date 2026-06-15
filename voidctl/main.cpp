@@ -764,12 +764,14 @@ int main(int argc, char** argv)
     else return Usage();
 
     // The live operation went through the driver, but saving it for restore-on-start
-    // writes HKLM and needs elevation. Warn so a "successful" change that silently
-    // won't survive a restart is not a surprise.
+    // writes the config file C:\ProgramData\.voidrv\display.ini. The installer creates
+    // that folder writable by everyone, so this normally succeeds unelevated; warn only
+    // if the file is not writable (e.g. VoidDisplay was not installed via the setup).
     if (rc == 0 && persists && !VoidrvDisplayPersistenceWritable()) {
         std::printf(
-            "  warning: not elevated - this change is live but will NOT survive an adapter\n"
-            "           restart or reboot. Run voidctl as administrator to persist it.\n");
+            "  warning: cannot write C:\\ProgramData\\.voidrv\\display.ini - this change is\n"
+            "           live but will NOT survive an adapter restart or reboot. Install\n"
+            "           VoidDisplay via the setup (it creates the folder writable).\n");
     }
     return rc;
 }

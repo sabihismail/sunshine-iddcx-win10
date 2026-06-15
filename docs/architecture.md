@@ -89,9 +89,10 @@ Void favors explicit lifetime over session coupling:
 - A virtual display or input device exists from the moment it is added until it is
   explicitly removed or the driver unloads. There is no keepalive timer; nothing
   has to ping the driver to keep a device alive.
-- Optionally, device state (which displays/devices were present, and their config)
-  is recorded under the driver's hardware registry key and restored on the next
-  start, so a configured host comes back the same after reboot.
+- Optionally, display state (which monitors were present, and their modes) is recorded
+  in a config file under `%ProgramData%` (not the registry - the user-mode host cannot
+  write there) and restored on the next start, so a configured host comes back the same
+  after a reboot. Input devices are plugged on demand by the host and are not persisted.
 
 ## Build, signing, and platform
 

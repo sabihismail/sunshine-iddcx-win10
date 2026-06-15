@@ -304,8 +304,9 @@ control interface is opened.
 - **Audio.** Virtual speaker and microphone are a separate future component
   (`VoidAudio`), a dedicated virtual audio endpoint, not part of this driver.
 - **Persistence.** Input devices are plugged on demand by the host application and
-  are not restored across reboot (unlike VoidDisplay monitors). The registry hook
-  is reserved for a later always-on mouse/keyboard option.
+  are not restored across reboot (unlike VoidDisplay monitors). A config-file hook
+  (the same `%ProgramData%` file VoidDisplay uses) is reserved for a later always-on
+  mouse/keyboard option.
 - N-key-rollover keyboard; per-device descriptor customization.
 
 ## 10. Open items
