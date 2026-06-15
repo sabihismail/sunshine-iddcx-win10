@@ -1,10 +1,10 @@
 /*
  * voidctl - command-line control + smoke-test tool for the Void drivers.
  *
- * Usage:
+ * Usage ('display' may be abbreviated 'dp' / 'dsp'):
  *   voidctl display status
  *   voidctl display version
- *   voidctl display list
+ *   voidctl display list      (driver slots + GDI \\.\DISPLAYn names + monitor UIDs)
  *   voidctl display add [WxH@Hz]
  *   voidctl display remove <index>
  *   voidctl display setmode <index> <WxH@Hz>
@@ -32,10 +32,11 @@ static int Usage()
 {
     std::printf(
         "voidctl - Void driver control\n"
+        "  ('display' may be abbreviated 'dp' or 'dsp')\n"
         "\n"
         "  voidctl display status\n"
         "  voidctl display version\n"
-        "  voidctl display list\n"
+        "  voidctl display list              (slots + GDI device names \\\\.\\DISPLAYn + UIDs)\n"
         "  voidctl display add [WxH@Hz]      (e.g. add 1920x1080@60; omit for default)\n"
         "  voidctl display remove <index>\n"
         "  voidctl display setmode <index> <WxH@Hz>\n"
@@ -107,6 +108,77 @@ static int CmdVersion()
     return 0;
 }
 
+// Parse the integer following "UID" in a monitor device-interface path, or -1.
+// e.g. "\\?\DISPLAY#VVD0000#5&abc&UID256#{guid}" -> 256. The UID is the durable
+// per-monitor identifier carried in the device path (and in QueryDisplayConfig's
+// monitorDevicePath), so it survives reboots/replug where \\.\DISPLAYn does not.
+static int ParseMonitorUid(const wchar_t* path)
+{
+    const wchar_t* p = path ? wcsstr(path, L"UID") : nullptr;
+    if (!p) {
+        return -1;
+    }
+    p += 3;
+    if (*p < L'0' || *p > L'9') {
+        return -1;
+    }
+    int uid = 0;
+    while (*p >= L'0' && *p <= L'9') {
+        uid = uid * 10 + (int)(*p - L'0');
+        ++p;
+    }
+    return uid;
+}
+
+// Surface the Windows-side identity of each Void monitor that GDI can see: the
+// adapter's GDI device name (\\.\DISPLAYn - this is what a stream host like Sunshine
+// puts in output_name, but it is VOLATILE: Windows reassigns the ordinal across
+// reboots / GPU hotplug / monitor add-remove) and the monitor's stable device-
+// interface path plus its UID. Pin the device path or UID in host config, not
+// \\.\DISPLAYn. Detached Void monitors are not enumerable via GDI, so this lists
+// only currently-attached ones.
+static void PrintVoidGdiMonitors()
+{
+    std::printf("\nWindows display devices (Void), as GDI sees them now:\n");
+
+    DISPLAY_DEVICEW adapter;
+    ZeroMemory(&adapter, sizeof(adapter));
+    adapter.cb = sizeof(adapter);
+
+    bool any = false;
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i) {
+        if (wcsstr(adapter.DeviceString, L"Void Virtual Display")) {
+            const char* primary = (adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? " (primary)" : "";
+            const char* active  = (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? "" : " (detached)";
+
+            DISPLAY_DEVICEW mon;
+            ZeroMemory(&mon, sizeof(mon));
+            mon.cb = sizeof(mon);
+            bool hadMon = false;
+            for (DWORD j = 0;
+                 EnumDisplayDevicesW(adapter.DeviceName, j, &mon, EDD_GET_DEVICE_INTERFACE_NAME);
+                 ++j) {
+                std::printf("  %ls%s%s\n", adapter.DeviceName, primary, active);
+                std::printf("      uid=%d  path=%ls\n", ParseMonitorUid(mon.DeviceID), mon.DeviceID);
+                hadMon = true;
+                ZeroMemory(&mon, sizeof(mon));
+                mon.cb = sizeof(mon);
+            }
+            if (!hadMon) {
+                std::printf("  %ls%s%s  (no monitor child enumerated)\n", adapter.DeviceName, primary, active);
+            }
+            any = true;
+        }
+        ZeroMemory(&adapter, sizeof(adapter));
+        adapter.cb = sizeof(adapter);
+    }
+
+    if (!any) {
+        std::printf("  (none attached - 'display add' one first; detached monitors do not\n"
+                    "   appear here, only ones Windows has attached to the desktop)\n");
+    }
+}
+
 static int CmdList()
 {
     VoidrvDisplayHandle h = VoidrvDisplayOpen();
@@ -129,6 +201,7 @@ static int CmdList()
                         st.Entries[i].Mode.RefreshHz);
         }
     }
+    PrintVoidGdiMonitors();
     VoidrvDisplayClose(h);
     return 0;
 }
@@ -701,6 +774,11 @@ int main(int argc, char** argv)
 
     const char* group = argv[1];
     const char* cmd = argv[2];
+
+    // Short aliases for the most-typed group.
+    if (std::strcmp(group, "dp") == 0 || std::strcmp(group, "dsp") == 0) {
+        group = "display";
+    }
     int    rest_argc = argc - 3;
     char** rest_argv = argv + 3;
 
