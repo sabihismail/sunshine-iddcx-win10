@@ -11,6 +11,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      build_idd12:
+        description: 'Also build VoidDisplay IddCx 1.2 tier (Win10 1709 / Server 2019+)'
+        type: boolean
+        default: false
+      build_idd10:
+        description: 'Also build VoidDisplay IddCx 1.0 tier (Win10 1607 / Server 2016+)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -84,6 +93,41 @@ jobs:
             }
           }
           if ($failed.Count -gt 0) { throw ("Builds failed:`n" + ($failed -join "`n")) }
+
+      # Older-OS VoidDisplay variants - only the IddCx driver has tiers (SDK/CLI/VoidInput
+      # are version-agnostic). Manual-trigger only; outputs land in x64\Release_Idd12\ etc.
+      - name: Build older-OS VoidDisplay tiers (manual)
+        if: ${{ inputs.build_idd12 || inputs.build_idd10 }}
+        shell: pwsh
+        env:
+          BUILD_IDD12: ${{ inputs.build_idd12 }}
+          BUILD_IDD10: ${{ inputs.build_idd10 }}
+        run: |
+          $failed = @()
+          $tiers = @()
+          if ($env:BUILD_IDD12 -eq 'true') { $tiers += 12 }
+          if ($env:BUILD_IDD10 -eq 'true') { $tiers += 10 }
+          Write-Host "Building VoidDisplay tiers: $($tiers -join ', ')"
+          foreach ($plat in 'x64', 'ARM64') {
+            foreach ($tier in $tiers) {
+              Write-Host "::group::Release | $plat | VoidDisplay IddTier=$tier"
+              msbuild void-display\VoidDisplay.vcxproj /m `
+                /p:Configuration=Release `
+                /p:Platform=$plat `
+                /p:IddTier=$tier `
+                /p:SpectreMitigation=false `
+                /p:SignMode=Off `
+                /p:EnableInfVerif=false `
+                /p:RunApiValidator=false `
+                /v:minimal /nologo
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "::error::Build failed: Release $plat VoidDisplay IddTier=$tier"
+                $failed += "Release/$plat/Idd$tier"
+              }
+              Write-Host "::endgroup::"
+            }
+          }
+          if ($failed.Count -gt 0) { throw ("Tier builds failed:`n" + ($failed -join "`n")) }
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
