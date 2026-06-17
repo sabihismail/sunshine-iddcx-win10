@@ -13,29 +13,46 @@ A UMDF IddCx driver (`IddCx0102`) that adds up to 8 virtual monitors to a headle
 
 ## Diff vs. upstream `void-drivers`
 
-- **UMDF 2.19 in the INF** (down from 2.25) — in-box version on Win10 22H2; binary is forward-compatible
-- **Self-signed cert install path** — Win10 install trusts the cert in `LocalMachine\Root` + `LocalMachine\TrustedPublisher`; no `testsigning` mode needed
-- **GitHub Actions CI** — `windows-2022` runner installs WDK 10.0.22621, builds with MSBuild, signs with a generated self-signed cert, packages the DLL+INF+CAT
-- Everything else (architecture, IOCTL design, mode table, EDID synthesis, hardware-cursor plane, persistence in `%ProgramData%\.voidrv\display.ini`) is **upstream unchanged** and credited accordingly
+- **Upstream-synced** at the fork origin (`sabihismail/sunshine-iddcx-win10` tracks `nomi-san/void-drivers`). Uses upstream's tiered build (`/p:IddTier=10|12|14`) so a single source produces three binaries:
+  - **IddTier=14** (default, IddCx 1.4 / UMDF 2.25) — Win10 1903+ / Server 2022+ / Win11
+  - **IddTier=12** (IddCx 1.2 / UMDF 2.19) — Win10 1709+ / Server 2019+ (manual dispatch)
+  - **IddTier=10** (IddCx 1.0 / UMDF 2.15) — Win10 1607+ / Server 2016+ (manual dispatch)
+- **Win10 install path** — cert import to `LocalMachine\Root` + `LocalMachine\TrustedPublisher`; no `testsigning` mode needed. See [`docs/`](./docs/) for the full Win10 install procedure.
+- **Upstream CI** (`build-drivers.yml`) — `windows-2022` runner, WDK 10.0.26100, MSBuild, `SignMode=Off` (sign with the real cert at release time; CI artifacts are unsigned for inspection).
 
-## When to use this vs. alternatives
+## When to use which tier
 
-| Setup | Path |
-|---|---|
-| Headless GPU-PV host, Win10 22H2, single GPU, streaming to client | **This driver** |
-| Headless GPU-PV host, Win11 22H2+, single GPU | Use upstream `nomi-san/void-drivers` directly |
-| Win10 with physical display on GPU | Synthetic path is fine, don't need this |
-| DDA with second GPU for host | Synthetic path is fine, don't need this |
+| Host | Tier | Notes |
+|---|---|---|
+| Win10 22H2, 21H2, 20H2, 2004 | **14** | In-box IddCx is 1.4. Default build. |
+| Win10 1909, 1903 | **14** | In-box IddCx is 1.4. |
+| Win10 1809, 1803 | **12** | In-box IddCx is 1.3 — needs the 1.2-compat tier. |
+| Win10 1709 | **12** | In-box IddCx is 1.2. |
+| Win10 1607 | **10** | In-box IddCx is 1.0. |
+| Win11 / Server 2022+ | **14** | Default. |
+| Server 2019 | **12** | |
+| Server 2016 | **10** | |
 
 ## Build
 
 ```bash
-# via GitHub Actions: Actions tab -> "build-win10" -> Run workflow
-# or locally with WDK 10.0.22621 + VS 2022 + Windows SDK 22621:
+# via GitHub Actions: Actions tab -> "Build drivers" -> Run workflow
+# Manual dispatch has checkboxes for build_idd12 and build_idd10
+
+# local build (default tier 14):
 msbuild void-display\VoidDisplay.vcxproj /p:Configuration=Release /p:Platform=x64
+
+# local build for older OS:
+msbuild void-display\VoidDisplay.vcxproj /p:Configuration=Release /p:Platform=x64 /p:IddTier=10
+
+# full suite (display + input + SDK + CLI):
+msbuild void-display\VoidDisplay.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild void-input\VoidInput.vcxproj   /p:Configuration=Release /p:Platform=x64
+msbuild libvoidrv\libvoidrv.vcxproj    /p:Configuration=Release /p:Platform=x64
+msbuild voidctl\voidctl.vcxproj        /p:Configuration=Release /p:Platform=x64
 ```
 
-The CI patches the INF's `UmdfLibraryVersion` to 2.19 after build. For local builds, edit the INF yourself or use `UMDF_VERSION_MINOR=19` in the build command.
+`UmdfLibraryVersion` is stamped by `stampinf` from the `UMDF_VERSION_MINOR` per tier — no post-build patching needed.
 
 ## Install
 
