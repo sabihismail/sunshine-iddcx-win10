@@ -1,90 +1,78 @@
-<h1 align="center">Void Drivers</h1>
-<p align="center">
-  Windows virtual drivers for <b>headless cloud-gaming hosts</b> - genuine-looking
-  display, mouse, keyboard, and gamepad with no physical hardware attached.
-</p>
-<p align="center">
-  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/status-pre--alpha-orange?style=for-the-badge" />
-</p>
+# sunshine-vdd
 
----
+IddCx virtual display driver for **headless GPU-PV hosts running Sunshine** (or any remote-streaming / game-streaming server). Win10 21H2+ / Win11. This is a public fork of [`nomi-san/void-drivers`](https://github.com/nomi-san/void-drivers) with the changes needed to run on Windows 10.
 
-## About
+## What it is
 
-**Void** is a pair of Windows drivers built to make a headless machine look like a
-fully-equipped gaming PC to games and anti-cheat (Vanguard, EAC, BattlEye):
+A UMDF IddCx driver (`IddCx0102`) that adds up to 8 virtual monitors to a headless host so capture/streaming software sees a real display surface on the GPU-PV adapter. This routes the OS desktop through the GPU's render path instead of the synthetic CPU-composited Hyper-V Video adapter, giving:
 
-| Component | Tech | Runs in | What it does |
-|---|---|---|---|
-| **VoidDisplay** | IddCx UMDF | user mode | Adds virtual monitors for video capture / remote streaming |
-| **VoidInput** | UMDF + VHF (HID) | user mode | Hosts virtual HID mouse, keyboard, Xbox One / DS4 / DS5 gamepads, and touch |
-| **libvoidrv** | C++ SDK (C ABI) | - | One library that drives both, via `voidrv.h` |
-| **voidctl** | CLI | - | Command-line control + test harness |
+- **1-5ms capture latency** instead of 30-80ms (synthetic = CPU bound, IddCx = GPU DirectX surface)
+- **vsync-aligned frame pacing**, no tearing under load
+- **Real hardware cursor plane** (capture pipelines that render their own cursor — common low-latency design — see only the desktop, not a baked-in mouse)
+- **NVENC-friendly** — the GPU is already rendering the frame; Sunshine just copies the surface
 
-Void is built from the ground up as clean, directly-controllable virtual hardware:
-devices that persist on your terms, driven by a single SDK with no session coupling.
+## Diff vs. upstream `void-drivers`
 
-### Why it exists
+- **UMDF 2.19 in the INF** (down from 2.25) — in-box version on Win10 22H2; binary is forward-compatible
+- **Self-signed cert install path** — Win10 install trusts the cert in `LocalMachine\Root` + `LocalMachine\TrustedPublisher`; no `testsigning` mode needed
+- **GitHub Actions CI** — `windows-2022` runner installs WDK 10.0.22621, builds with MSBuild, signs with a generated self-signed cert, packages the DLL+INF+CAT
+- Everything else (architecture, IOCTL design, mode table, EDID synthesis, hardware-cursor plane, persistence in `%ProgramData%\.voidrv\display.ini`) is **upstream unchanged** and credited accordingly
 
-- **Headless hosts have no GPU display output, no input devices.** Void supplies both
-  as real device nodes, so capture APIs see a monitor and games see real controllers.
-- **Real input, not `SendInput`.** VoidInput presents genuine HID devices (real
-  VID/PID, real report descriptors) built on the in-box Virtual HID Framework, so
-  input survives anti-cheat that blocks injected events. Gamepads are HID, reaching
-  games through DirectInput, Windows.Gaming.Input, and Steam Input.
-- **No keepalive.** Void displays persist until you explicitly remove them - no
-  per-display heartbeat or periodic ping to keep them alive.
+## When to use this vs. alternatives
 
-## Design highlights
+| Setup | Path |
+|---|---|
+| Headless GPU-PV host, Win10 22H2, single GPU, streaming to client | **This driver** |
+| Headless GPU-PV host, Win11 22H2+, single GPU | Use upstream `nomi-san/void-drivers` directly |
+| Win10 with physical display on GPU | Synthetic path is fine, don't need this |
+| DDA with second GPU for host | Synthetic path is fine, don't need this |
 
-- **VoidDisplay** - up to 8 virtual monitors, default 1920x1080@60, custom `VVD`
-  EDID, SDR first (HDR planned). Persists across sessions, no heartbeat.
-- **VoidInput** - a UMDF driver on the in-box Virtual HID Framework that creates
-  virtual HID devices on demand. Each clones a genuine HID identity (VID/PID + report
-  descriptor) so it's indistinguishable from real hardware to applications; only the
-  control interface is Void-branded.
-- **One control surface** - both drivers are driven through `DeviceIoControl`, wrapped
-  by `libvoidrv` so host apps never touch raw IOCTLs.
+## Build
 
-## Status & roadmap
-
-Pre-alpha - project scaffolding stage. Implementation order:
-
-1. **VoidDisplay** (in progress) - virtual monitor + control IOCTLs.
-2. **VoidInput** - VHF enumerator -> HID mouse -> keyboard -> Xbox One -> DS4/DS5 -> touch.
-3. **libvoidrv / voidctl** - SDK + CLI alongside each milestone.
-
-## Building
-
-Requires **Visual Studio 2022** + **WDK 10.0.26100** (with VS integration), x64.
-
-```pwsh
-# from a Developer PowerShell / Command Prompt
-msbuild Void.sln /p:Configuration=Debug /p:Platform=x64
+```bash
+# via GitHub Actions: Actions tab -> "build-win10" -> Run workflow
+# or locally with WDK 10.0.22621 + VS 2022 + Windows SDK 22621:
+msbuild void-display\VoidDisplay.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
-Both drivers are UMDF (user mode), so they install with a local test certificate
-(placed in `Root` + `TrustedPublisher`) - **no `testsigning` mode and no Microsoft
-attestation required**:
+The CI patches the INF's `UmdfLibraryVersion` to 2.19 after build. For local builds, edit the INF yourself or use `UMDF_VERSION_MINOR=19` in the build command.
 
-```pwsh
-# create a self-signed test cert, then sign the .dll + .cat and trust the cert
+## Install
+
+```powershell
+# 1. Trust the bundled test cert (in LocalMachine\Root + LocalMachine\TrustedPublisher)
+Import-PfxCertificate -FilePath SunshineVDD.pfx -CertStoreLocation Cert:\LocalMachine\My -Password (Read-Host -AsSecureString)
+# (or use the .cer via the GUI: double-click -> Install Certificate -> Local Machine -> Trusted Publishers)
+
+# 2. Install the driver
+pnputil /add-driver VoidDisplay.inf /install
+
+# 3. Add a virtual display via IOCTL (or use the SDK from upstream void-drivers)
+# Upstream: libvoidrv / voidctl - or roll your own IOCTL caller.
 ```
 
-Production signing is a directly-applied OV/EV Authenticode signature - a deferred
-release task.
+## Use with Sunshine
 
-## Repository layout
+1. Install the driver (above) and reboot
+2. Add a virtual display (e.g. `1920x1080@60`)
+3. Set the new virtual display as the **primary** monitor in Windows Display Settings (right-click desktop -> Display settings)
+4. The OS now renders the desktop to the GPU-PV adapter through the IddCx surface
+5. Sunshine captures the surface; Moonlight on the client receives the stream
 
-```
-void-display/   VoidDisplay (IddCx UMDF, C++)
-void-input/     VoidInput  (UMDF + VHF HID, C++)
-libvoidrv/      SDK (voidrv.h)
-voidctl/        CLI
-docs/           Design docs
-```
+## Performance notes (vs. synthetic Hyper-V Video path)
 
-## License
+| | Synthetic | IddCx (this) |
+|---|---|---|
+| Compositing | CPU (DWM host loop) | GPU (DirectX surface) |
+| Latency | 30-80ms | 1-5ms |
+| 1080p60 CPU use | 15-30% core | 1-3% (just copy) |
+| Frame pacing | Teary under load | Vsync-aligned |
+| Hardware cursor | No (baked in) | Yes (real plane) |
+| Anti-cheat friendliness | Often flagged headless synthetic | Real display surface, AC happy |
 
-MIT.
+## Credits
+
+- Architecture, IOCTL design, EDID synthesis, hardware-cursor handling, persistence model, default mode table: [`nomi-san/void-drivers`](https://github.com/nomi-san/void-drivers) — MIT
+- IddCx class extension + DDI: Microsoft
+- Real-world deployment for headless game-streaming hosts: [`nomi-san/parsec-vdd`](https://github.com/nomi-san/parsec-vdd) (5.3k stars, also MIT)
+- This fork: `sabihismail/sunshine-vdd` (public fork, MIT)

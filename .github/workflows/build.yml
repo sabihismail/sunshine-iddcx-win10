@@ -1,0 +1,137 @@
+name: build-win10
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show initial env
+        shell: pwsh
+        run: |
+          Write-Host "=== WDK + SDK check ==="
+          @("C:\Program Files (x86)\Windows Kits\10\Lib","C:\Program Files\Windows Kits\10\Lib") | ForEach-Object { if (Test-Path $_) { Write-Host "Found: $_"; Get-ChildItem $_ -Directory -ErrorAction SilentlyContinue | Where-Object Name -match "^\d+\.\d+\.\d+" | Select-Object -First 5 | ForEach-Object { "  $($_.Name)" } } }
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Where-Object Name -match "^\d+\.\d+\.\d+" | Select-Object -First 5 | ForEach-Object { "  $($_.Name)" }
+
+      - name: Download + install WDK 10.0.22621
+        shell: pwsh
+        run: |
+          $isoDir = "C:\wdk-iso"
+          $wdksetup = "$isoDir\wdksetup.exe"
+          if (-not (Test-Path $wdksetup)) {
+            New-Item -ItemType Directory -Path $isoDir -Force | Out-Null
+            $url = 'https://go.microsoft.com/fwlink/?linkid=2196287'
+            Write-Host "Downloading WDK from $url"
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $url -OutFile $wdksetup -UseBasicParsing
+          }
+          $size = (Get-Item $wdksetup).Length
+          Write-Host "WDK bootstrap: $wdksetup ($size bytes)"
+          Write-Host "Installing silently..."
+          $p = Start-Process -FilePath $wdksetup -ArgumentList "/q" -Wait -PassThru
+          Write-Host "Install exit: $($p.ExitCode)"
+          $wdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -ErrorAction SilentlyContinue | Where-Object Name -match "^\d+\.\d+\.\d+" | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $wdk) { throw "WDK install failed" }
+          Write-Host "Installed WDK: $($wdk.Name)"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib\$($wdk.Name)\km" -ErrorAction SilentlyContinue | Select-Object -First 5 | ForEach-Object { "  $($_.Name)" }
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\$($wdk.Name)\x64" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($signtool) { Write-Host "signtool: $($signtool.FullName)" }
+          else { Write-Host "WARN: signtool not found" }
+          echo "WDK_VERSION=$($wdk.Name)" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build VoidDisplay (x64, Release) for Win10
+        shell: pwsh
+        run: |
+          $sln = "void-display\VoidDisplay.vcxproj"
+          $cfg = "Release|x64"
+          $out = "out"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $args = @(
+            $sln, "/m:2", "/v:m",
+            "/p:Configuration=Release", "/p:Platform=x64",
+            "/p:UMDF_VERSION_MAJOR=2", "/p:UMDF_VERSION_MINOR=19",
+            "/p:IDDCX_VERSION_MAJOR=1", "/p:IDDCX_VERSION_MINOR=4",
+            "/p:WindowsTargetPlatformVersion=10.0.22621.0",
+            "/p:OutputPath=$out\"
+          )
+          Write-Host "MSBuild: $($args -join ' ')"
+          & MSBuild.exe @args 2>&1 | Tee-Object -FilePath msbuild.log | Select-Object -Last 40
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "---MSBuild errors---"
+            Select-String -Path msbuild.log -Pattern "error " -SimpleMatch:$false | Select-Object -First 20
+            throw "MSBuild failed: $LASTEXITCODE"
+          }
+          Get-ChildItem $out -Recurse
+
+      - name: Patch INF for Win10 (UMDF 2.19)
+        shell: pwsh
+        run: |
+          $inf = Get-ChildItem out -Recurse -Filter "VoidDisplay.inf" | Select-Object -First 1
+          if (-not $inf) { throw "INF not found" }
+          Write-Host "Patching: $($inf.FullName)"
+          $c = Get-Content $inf.FullName -Raw
+          $c = $c -replace 'UmdfLibraryVersion\s*=\s*2\.\d+\.\d+', 'UmdfLibraryVersion = 2.19.0'
+          Set-Content -Path $inf.FullName -Value $c -NoNewline
+          Get-Content $inf.FullName | Select-String "UmdfLibraryVersion" | ForEach-Object { "  INF: $_" }
+
+      - name: Generate self-signed code-signing cert
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=SunshineVDD Test" -CertStoreLocation Cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(5) -KeyUsage DigitalSignature
+          Write-Host "Cert thumbprint: $($cert.Thumbprint)"
+          "CertThumbprint=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append
+          $pwd = ConvertTo-SecureString -String "tmp" -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath "out\SunshineVDD.pfx" -Password $pwd | Out-Null
+          Export-Certificate -Cert $cert -FilePath "out\SunshineVDD.cer" -Type CERT | Out-Null
+          foreach ($storeName in @("Root","TrustedPublisher")) {
+            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+            $store.Open("ReadWrite"); $store.Add($cert); $store.Close()
+            Write-Host "Added to $storeName"
+          }
+
+      - name: Sign DLL + create + sign catalog
+        shell: pwsh
+        run: |
+          $thumb = $env:CertThumbprint
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool not found" }
+          Write-Host "Using: $($signtool.FullName)"
+          $dll = Get-ChildItem out -Recurse -Filter "VoidDisplay.dll" | Select-Object -First 1
+          $inf = Get-ChildItem out -Recurse -Filter "VoidDisplay.inf" | Select-Object -First 1
+          Write-Host "DLL: $($dll.FullName)"
+          Write-Host "INF: $($inf.FullName)"
+          & $signtool.FullName sign /fd SHA256 /sha1 $thumb /sm $dll.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool DLL failed: $LASTEXITCODE" }
+          $cat = Join-Path $dll.DirectoryName "VoidDisplay.cat"
+          if (Test-Path $cat) { Remove-Item $cat -Force }
+          New-FileCatalog -Path $dll.DirectoryName -CatalogFilePath $cat -CatalogVersion 2.0 | Out-Null
+          & $signtool.FullName sign /fd SHA256 /sha1 $thumb /sm $cat
+          if ($LASTEXITCODE -ne 0) { throw "signtool CAT failed: $LASTEXITCODE" }
+          Write-Host "Signed: DLL and CAT"
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $stage = "dist"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Get-ChildItem out -Recurse -File -Filter "VoidDisplay.*" | ForEach-Object { Copy-Item $_.FullName -Destination $stage }
+          Get-ChildItem out -Filter "*.pfx","*.cer" | ForEach-Object { Copy-Item $_.FullName -Destination $stage }
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunshine-vdd-win10
+          path: dist/
+          if-no-files-found: error
